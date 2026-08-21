@@ -5,11 +5,21 @@ from typing import Any
 import httpx
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
-
+from mcp.server.transport_security import TransportSecuritySettings
 load_dotenv()
 
-mcp = FastMCP("Lietuvos viešieji pirkimai")
-
+mcp = FastMCP(
+    "Lietuvos viešieji pirkimai",
+    transport_security=TransportSecuritySettings(
+        allowed_hosts=[
+            "lietuvos-viesieji-pirkimai-mcp.onrender.com",
+            "lietuvos-viesieji-pirkimai-mcp.onrender.com:*",
+        ],
+        allowed_origins=[
+            "https://lietuvos-viesieji-pirkimai-mcp.onrender.com",
+        ],
+    ),
+)
 VPT_API_URL = os.getenv(
     "VPT_API_URL",
     "https://viesiejipirkimai.lt/epps-integration/api/cft-details-export",

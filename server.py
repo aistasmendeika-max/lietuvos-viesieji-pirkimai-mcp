@@ -1,3 +1,4 @@
+mport asyncio
 import html
 import json
 import os
@@ -29,36 +30,83 @@ VPT_API_URL = os.getenv(
     "VPT_API_URL",
     "https://viesiejipirkimai.lt/epps-integration/api/cft-details-export",
 )
-HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "45"))
+VPT_PAGE_SIZE = 20
+HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "120"))
 
 
 def _api_key() -> str:
     key = os.getenv("VPT_API_KEY", "").strip()
     if not key:
         raise RuntimeError(
-            "Nenustatytas VPT_API_KEY. Įrašykite jį Render Environment Variables."
+            "Nenustatytas VPT_API_KEY. Įrašykite jį Render → Environment."
         )
     return key
 
 
-async def _fetch_page(page_num: int, page_size: int) -> Any:
+async def _fetch_page(page_num: int, page_size: int = VPT_PAGE_SIZE) -> Any:
     if page_num < 1:
         raise ValueError("page_num turi būti >= 1")
-    if not 1 <= page_size <= 100:
-        raise ValueError("page_size turi būti nuo 1 iki 100")
+
+    page_size = min(max(int(page_size), 1), VPT_PAGE_SIZE)
 
     headers = {
         "Accept": "application/json",
         "Content-Type": "application/json",
         "apiKey": _api_key(),
-        "User-Agent": "lietuvos-viesieji-pirkimai-mcp/1.0",
+        "User-Agent": "lietuvos-viesieji-pirkimai-mcp/1.2",
     }
     payload = {"pageSize": page_size, "pageNum": page_num}
 
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
-        response = await client.post(VPT_API_URL, headers=headers, json=payload)
-        response.raise_for_status()
-        return response.json()
+    timeout = httpx.Timeout(
+        connect=20.0,
+        read=HTTP_TIMEOUT,
+        write=30.0,
+        pool=20.0,
+    )
+
+    last_error: Exception | None = None
+
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient(
+                timeout=timeout,
+                follow_redirects=True,
+                http2=False,
+            ) as client:
+                response = await client.post(
+                    VPT_API_URL,
+                    headers=headers,
+                    json=payload,
+                )
+
+                if response.status_code >= 400:
+                    body = response.text[:1500]
+                    raise RuntimeError(
+                        f"CVP IS API grąžino HTTP {response.status_code}. "
+                        f"Atsakymas: {body or '(tuščias)'}"
+                    )
+
+                try:
+                    return response.json()
+                except Exception as exc:
+                    body = response.text[:1500]
+                    raise RuntimeError(
+                        "CVP IS API grąžino ne JSON atsakymą. "
+                        f"Content-Type={response.headers.get('content-type')!r}; "
+                        f"atsakymas={body!r}"
+                    ) from exc
+
+        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            last_error = exc
+            if attempt < 2:
+                await asyncio.sleep(2 * (attempt + 1))
+                continue
+            raise RuntimeError(
+                "Nepavyko prisijungti prie CVP IS API po 3 bandymų. "
+                f"Klaida: {type(exc).__name__}: {exc!r}"
+            ) from exc
+
+    raise RuntimeError(f"CVP IS API klaida: {last_error!r}")
 
 
 def _records(payload: Any) -> list[Any]:
@@ -68,8 +116,14 @@ def _records(payload: Any) -> list[Any]:
         return [payload]
 
     for key in (
-        "content", "items", "results", "data", "records",
-        "procurements", "cfts", "result",
+        "content",
+        "items",
+        "results",
+        "data",
+        "records",
+        "procurements",
+        "cfts",
+        "result",
     ):
         value = payload.get(key)
         if isinstance(value, list):
@@ -78,6 +132,7 @@ def _records(payload: Any) -> list[Any]:
             nested = _records(value)
             if nested:
                 return nested
+
     return [payload]
 
 
@@ -85,41 +140,49 @@ async def _search_records(
     query: str,
     start_page: int = 1,
     pages: int = 5,
-    page_size: int = 50,
+    page_size: int = VPT_PAGE_SIZE,
     limit: int = 50,
 ) -> dict[str, Any]:
     query = query.strip()
     if not query:
-        raise ValueError("query negali būti tuščias")
+        raise ValueError("Paieškos frazė negali būti tuščia.")
     if not 1 <= pages <= 50:
-        raise ValueError("pages turi būti nuo 1 iki 50")
+        raise ValueError("Puslapių skaičius turi būti nuo 1 iki 50.")
     if not 1 <= limit <= 500:
-        raise ValueError("limit turi būti nuo 1 iki 500")
+        raise ValueError("Rezultatų limitas turi būti nuo 1 iki 500.")
 
     needle = query.casefold()
     matches: list[Any] = []
     scanned = 0
+    pages_scanned = 0
 
     for page in range(start_page, start_page + pages):
         payload = await _fetch_page(page, page_size)
         records = _records(payload)
+        pages_scanned += 1
+
         if not records:
             break
 
         for record in records:
             scanned += 1
-            haystack = json.dumps(record, ensure_ascii=False, default=str).casefold()
+            haystack = json.dumps(
+                record,
+                ensure_ascii=False,
+                default=str,
+            ).casefold()
+
             if needle in haystack:
                 matches.append(record)
                 if len(matches) >= limit:
                     break
+
         if len(matches) >= limit:
             break
 
     return {
         "query": query,
-        "start_page": start_page,
-        "pages_requested": pages,
+        "pages_scanned": pages_scanned,
         "records_scanned": scanned,
         "matches": len(matches),
         "items": matches,
@@ -138,7 +201,7 @@ async def search_cvpis(
     query: str,
     start_page: int = 1,
     pages: int = 5,
-    page_size: int = 50,
+    page_size: int = 20,
     limit: int = 50,
 ) -> str:
     """Ieškoti frazės naujosios CVP IS API įrašuose."""
@@ -160,7 +223,7 @@ def procurement_sources() -> str:
             "new_cvpis": "https://viesiejipirkimai.lt/",
             "new_cvpis_api": VPT_API_URL,
             "old_cvpp": "https://cvpp.eviesiejipirkimai.lt/",
-            "open_data": "https://data.gov.lt/datasets/2867/",
+            "open_data": "https://data.gov.lt/",
             "vpt": "https://vpt.lrv.lt/",
         },
         ensure_ascii=False,
@@ -186,7 +249,7 @@ button {{ background: #111827; color: white; cursor: pointer; }}
 small {{ color: #5b6673; }}
 pre {{ white-space: pre-wrap; word-break: break-word; background: #f8fafc; padding: 14px; border-radius: 8px; overflow: auto; }}
 .result {{ border-top: 1px solid #e5e7eb; padding: 16px 0; }}
-.error {{ color: #9b1c1c; background: #fff1f2; padding: 12px; border-radius: 8px; }}
+.error {{ color: #9b1c1c; background: #fff1f2; padding: 14px; border-radius: 8px; white-space: pre-wrap; }}
 @media (max-width: 700px) {{ form {{ grid-template-columns: 1fr; }} }}
 </style>
 </head>
@@ -199,9 +262,10 @@ async def web_search(request: Request) -> HTMLResponse:
     query = (request.query_params.get("q") or "").strip()
 
     try:
-        pages = min(max(int(request.query_params.get("pages", "5")), 1), 20)
+        pages = min(max(int(request.query_params.get("pages", "5")), 1), 50)
     except ValueError:
         pages = 5
+
     try:
         limit = min(max(int(request.query_params.get("limit", "25")), 1), 100)
     except ValueError:
@@ -213,11 +277,11 @@ async def web_search(request: Request) -> HTMLResponse:
 <p>Paieška naujosios CVP IS viešo API duomenyse.</p>
 <form method="get" action="/">
 <input name="q" value="{html.escape(query)}" placeholder="Pvz. Kretingos rajono savivaldybė, Rudkasa, sniego..." autofocus>
-<input type="number" name="pages" min="1" max="20" value="{pages}" title="API puslapių skaičius">
+<input type="number" name="pages" min="1" max="50" value="{pages}" title="API puslapių skaičius">
 <input type="number" name="limit" min="1" max="100" value="{limit}" title="Maks. rezultatų">
 <button type="submit">Ieškoti</button>
 </form>
-<small>Pirmas skaičius – kiek API puslapių tikrinti; antras – maksimalus rezultatų skaičius.</small>
+<small>Pirmas skaičius – kiek CVP IS API puslapių po 20 įrašų tikrinti; antras – maksimalus rezultatų skaičius.</small>
 </div>
 """
 
@@ -225,17 +289,34 @@ async def web_search(request: Request) -> HTMLResponse:
         return HTMLResponse(_page(form))
 
     try:
-        result = await _search_records(query=query, pages=pages, page_size=50, limit=limit)
+        result = await _search_records(
+            query=query,
+            pages=pages,
+            page_size=VPT_PAGE_SIZE,
+            limit=limit,
+        )
     except Exception as exc:
+        detail = (
+            f"{type(exc).__name__}: {exc}\n\n"
+            f"Techninė informacija: {exc!r}"
+        )
         return HTMLResponse(
-            _page(form + f'<div class="card"><div class="error">{html.escape(str(exc))}</div></div>'),
+            _page(
+                form
+                + '<div class="card"><h2>Paieškos klaida</h2>'
+                + f'<div class="error">{html.escape(detail)}</div></div>'
+            ),
             status_code=500,
         )
 
     rows = []
     for idx, item in enumerate(result["items"], start=1):
-        pretty = html.escape(json.dumps(item, ensure_ascii=False, indent=2, default=str))
-        rows.append(f'<div class="result"><strong>Rezultatas {idx}</strong><pre>{pretty}</pre></div>')
+        pretty = html.escape(
+            json.dumps(item, ensure_ascii=False, indent=2, default=str)
+        )
+        rows.append(
+            f'<div class="result"><strong>Rezultatas {idx}</strong><pre>{pretty}</pre></div>'
+        )
 
     if not rows:
         rows.append(
@@ -247,7 +328,7 @@ async def web_search(request: Request) -> HTMLResponse:
 <div class="card">
 <h2>Rezultatai</h2>
 <p>Paieška: <strong>{html.escape(query)}</strong></p>
-<p>Patikrinta įrašų: {result["records_scanned"]}. Rasta: {result["matches"]}.</p>
+<p>Patikrinta API puslapių: {result["pages_scanned"]}; įrašų: {result["records_scanned"]}; rasta: {result["matches"]}.</p>
 {''.join(rows)}
 </div>
 """

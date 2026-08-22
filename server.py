@@ -115,7 +115,7 @@ async def _fetch_new_page(page: int) -> Any:
         "Accept": "application/json",
         "Content-Type": "application/json",
         "apiKey": _api_key(),
-        "User-Agent": "lietuvos-viesieji-pirkimai/11.0",
+        "User-Agent": "lietuvos-viesieji-pirkimai/12.0",
     }
     body = {"pageSize": VPT_PAGE_SIZE, "pageNum": page}
 
@@ -218,7 +218,7 @@ def _looks_like_document_link(href: str, label: str) -> bool:
 async def _fetch_html(url: str) -> tuple[str, str]:
     headers = {
         "Accept": "text/html,application/xhtml+xml,application/pdf,*/*",
-        "User-Agent": "Mozilla/5.0 Lietuvos-viesieji-pirkimai-paieska/11.0",
+        "User-Agent": "Mozilla/5.0 Lietuvos-viesieji-pirkimai-paieska/12.0",
     }
     async with httpx.AsyncClient(timeout=_timeout(), follow_redirects=True) as client:
         r = await client.get(url, headers=headers)
@@ -258,6 +258,65 @@ def _extract_links(page_html: str, base_url: str) -> list[dict[str, str]]:
     return out
 
 
+
+def _filename_from_disposition(disposition: str) -> str:
+    if not disposition:
+        return ""
+    m = re.search(r"filename\*\s*=\s*UTF-8''([^;]+)", disposition, re.I)
+    if m:
+        from urllib.parse import unquote
+        return unquote(m.group(1).strip().strip('"'))
+    m = re.search(r'filename\s*=\s*"?([^";]+)"?', disposition, re.I)
+    return m.group(1).strip() if m else ""
+
+
+async def _probe_document_links(documents: list[dict[str, str]]) -> list[dict[str, Any]]:
+    semaphore = asyncio.Semaphore(3)
+
+    async def probe(item: dict[str, str]) -> dict[str, Any]:
+        async with semaphore:
+            url = item["url"]
+            result = dict(item)
+            headers = {
+                "User-Agent": "Mozilla/5.0 Lietuvos-viesieji-pirkimai-paieska/12.0",
+                "Accept": "*/*",
+            }
+
+            async with httpx.AsyncClient(
+                timeout=_timeout(),
+                follow_redirects=True,
+                headers=headers,
+                http2=False,
+                limits=httpx.Limits(max_keepalive_connections=2, max_connections=3),
+            ) as client:
+                try:
+                    r = await client.head(url)
+                    if r.status_code in (403, 405) or r.status_code >= 500:
+                        async with client.stream("GET", url) as sr:
+                            result["http_status"] = sr.status_code
+                            result["final_url"] = str(sr.url)
+                            result["content_type"] = sr.headers.get("content-type", "")
+                            result["content_length"] = sr.headers.get("content-length", "")
+                            disp = sr.headers.get("content-disposition", "")
+                            result["content_disposition"] = disp
+                            result["filename"] = _filename_from_disposition(disp)
+                    else:
+                        result["http_status"] = r.status_code
+                        result["final_url"] = str(r.url)
+                        result["content_type"] = r.headers.get("content-type", "")
+                        result["content_length"] = r.headers.get("content-length", "")
+                        disp = r.headers.get("content-disposition", "")
+                        result["content_disposition"] = disp
+                        result["filename"] = _filename_from_disposition(disp)
+
+                except Exception as exc:
+                    result["probe_error"] = f"{type(exc).__name__}: {exc}"
+
+            return result
+
+    return await asyncio.gather(*(probe(item) for item in documents[:20]))
+
+
 async def _extract_cvpis_documents(resource_id: str) -> dict[str, Any]:
     resource_id = str(resource_id).strip()
     if not resource_id.isdigit():
@@ -273,7 +332,7 @@ async def _extract_cvpis_documents(resource_id: str) -> dict[str, Any]:
 
     headers = {
         "Accept": "text/html,application/xhtml+xml,application/pdf,*/*",
-        "User-Agent": "Mozilla/5.0 Lietuvos-viesieji-pirkimai-paieska/11.0",
+        "User-Agent": "Mozilla/5.0 Lietuvos-viesieji-pirkimai-paieska/12.0",
         "Referer": f"{CVPIS_BASE}epps/cft/prepareViewCfTWS.do?resourceId={resource_id}",
     }
 
@@ -367,32 +426,49 @@ async def _extract_cvpis_documents(resource_id: str) -> dict[str, Any]:
                     "error": f"{type(exc).__name__}: {exc}",
                 })
 
-    def score(item: dict[str, str]) -> int:
-        blob = f'{item.get("label","")} {item.get("url","")}'.casefold()
+
+    documents = await _probe_document_links(documents)
+
+    def score(item: dict[str, Any]) -> int:
+        blob = " ".join(
+            str(item.get(k, ""))
+            for k in ("label", "url", "final_url", "filename", "content_disposition", "content_type")
+        ).casefold()
+
         score_value = 0
         if "sutart" in blob or "contract" in blob:
-            score_value += 100
+            score_value += 200
+        if "simra" in blob:
+            score_value += 120
         if "award" in blob or "winner" in blob or "result" in blob:
+            score_value += 40
+        if ".pdf" in blob or "application/pdf" in blob:
             score_value += 30
-        if ".pdf" in blob:
-            score_value += 20
         if any(ext in blob for ext in (".docx", ".doc", ".xlsx", ".xls", ".zip")):
             score_value += 10
         if "download" in blob or "attachment" in blob:
             score_value += 5
+        if item.get("http_status") == 200:
+            score_value += 3
         return score_value
 
-    documents.sort(key=score, reverse=True)
+    for item in documents:
+        item["score"] = score(item)
+
+    documents.sort(key=lambda x: x.get("score", 0), reverse=True)
+    likely_contract = documents[0] if documents and documents[0].get("score", 0) >= 100 else None
 
     return {
         "resource_id": resource_id,
         "documents_found": len(documents),
         "documents": documents,
+        "likely_contract": likely_contract,
         "pages_checked": pages,
         "session_crawl": True,
         "bounded_mode": True,
         "max_pages": MAX_PAGES,
     }
+
 
 @mcp.tool()
 async def extract_contract_documents(resource_id: str) -> str:
@@ -421,7 +497,7 @@ def _cvpp_search_url(query: str, page: int) -> str:
 async def _fetch_cvpp_page(query: str, page: int) -> str:
     headers = {
         "Accept": "text/html,application/xhtml+xml",
-        "User-Agent": "Mozilla/5.0 Lietuvos-viesieji-pirkimai-paieska/11.0",
+        "User-Agent": "Mozilla/5.0 Lietuvos-viesieji-pirkimai-paieska/12.0",
     }
     async with httpx.AsyncClient(timeout=_timeout(), follow_redirects=True) as client:
         r = await client.get(_cvpp_search_url(query, page), headers=headers)
@@ -547,7 +623,7 @@ async def _search_mano_konkursas(
 
     headers = {
         "Accept": "application/json,text/csv,text/plain,*/*",
-        "User-Agent": "Lietuvos-viesieji-pirkimai-paieska/11.0",
+        "User-Agent": "Lietuvos-viesieji-pirkimai-paieska/12.0",
     }
 
     try:
@@ -736,7 +812,7 @@ async def web_search(request: Request) -> HTMLResponse:
 <div></div><div></div>
 <button type="submit">Ištraukti dokumentus</button>
 </form>
-<small>Įrankis su CVP IS sesija pereina per pirkimo, rezultatų ir dokumentų puslapius, surenka failų nuorodas ir pirmiausia rodo tikėtinas sutartis.</small>
+<small>Įrankis su CVP IS sesija surenka failų nuorodas, patikrina jų HTTP antraštes, parodo tikrus failų vardus ir viršuje iškelia labiausiai tikėtiną sutartį.</small>
 </div>"""
 
     if not run_search:
@@ -863,12 +939,34 @@ async def documents_page(request: Request) -> HTMLResponse:
         )
 
     docs = []
+    likely_url = (result.get("likely_contract") or {}).get("url")
+
     for i, doc in enumerate(result["documents"], 1):
         label = html.escape(doc.get("label", "Dokumentas"))
         url = html.escape(doc["url"], quote=True)
+        filename = html.escape(str(doc.get("filename") or ""))
+        content_type = html.escape(str(doc.get("content_type") or ""))
+        status = html.escape(str(doc.get("http_status") or ""))
+        score = html.escape(str(doc.get("score") or ""))
+
+        likely = ""
+        if likely_url and doc.get("url") == likely_url:
+            likely = '<div class="note"><strong>Labiausiai tikėtina sutartis</strong></div>'
+
+        meta = []
+        if filename:
+            meta.append(f"<strong>Failas:</strong> {filename}")
+        if content_type:
+            meta.append(f"<strong>Tipas:</strong> {content_type}")
+        if status:
+            meta.append(f"<strong>HTTP:</strong> {status}")
+        if score:
+            meta.append(f"<strong>Prioritetas:</strong> {score}")
+
         docs.append(
-            f'<div class="doc"><strong>{i}. {label}</strong><br>'
-            f'<a href="{url}" target="_blank" rel="noopener">Atidaryti / atsisiųsti</a></div>'
+            f'<div class="doc">{likely}<strong>{i}. {label}</strong><br>'
+            + ("<br>".join(meta) + "<br>" if meta else "")
+            + f'<a href="{url}" target="_blank" rel="noopener">Atidaryti / atsisiųsti</a></div>'
         )
 
     if not docs:

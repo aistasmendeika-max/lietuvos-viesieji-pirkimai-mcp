@@ -124,24 +124,30 @@ def _is_file_like(url: str, label: str = "") -> bool:
     blob = f"{url} {label}".casefold()
     return any(x in blob for x in (
         ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".zip", ".rar", ".7z",
-        "download", "attachment", "file", "document"
+        "downloadnotice", "downloadfile", "attachment", "downloadattachment"
     ))
 
-
-def _classify(label: str, url: str, filename: str = "") -> str:
+def _classify(label: str, url: str, filename: str = "", content_type: str = "") -> str:
     blob = f"{label} {url} {filename}".casefold()
-    if any(x in blob for x in ("sutart", "contract")):
-        return "sutartis"
-    if any(x in blob for x in ("award", "winner", "laimėtoj", "rezultat")):
+    ctype = (content_type or "").casefold()
+    if "text/html" in ctype:
+        return "HTML puslapis"
+    if any(x in blob for x in (
+        "contract award notice", "award notice", "skelbimas apie sutarties skyrimą",
+        "laimėtoj", "winner", "award", "rezultat"
+    )):
         return "rezultatai / laimėtojas"
-    if any(x in blob for x in ("notice", "skelbim")):
+    if any(x in blob for x in ("voluntary ex-ante", "prior information notice", "notice", "skelbim")):
         return "skelbimas"
     if any(x in blob for x in ("atsakym", "paaiškin", "clarification")):
         return "paaiškinimas / atsakymas"
     if any(x in blob for x in ("tdp", "projekt", "technin")):
         return "techninis dokumentas"
+    if any(x in blob for x in ("sutart", "rangos sutart", "pirkimo sutart")):
+        return "sutartis"
+    if "contract" in blob and "notice" not in blob and "award" not in blob:
+        return "sutartis"
     return "kitas dokumentas"
-
 
 def _rank_document(item: dict[str, Any]) -> int:
     blob = " ".join(str(item.get(k, "")) for k in (
@@ -182,7 +188,7 @@ async def _fetch_new_api_page(client: httpx.AsyncClient, page: int) -> Any:
         "Accept": "application/json",
         "Content-Type": "application/json",
         "apiKey": _api_key(),
-        "User-Agent": "lietuvos-viesieji-pirkimai/14.0",
+        "User-Agent": "lietuvos-viesieji-pirkimai/15.0",
     }
     body = {"pageSize": VPT_PAGE_SIZE, "pageNum": page}
     r = await client.post(VPT_API_URL, headers=headers, json=body)
@@ -249,7 +255,7 @@ async def search_old_cvpp(buyer: str, keyword: str, limit: int) -> dict[str, Any
     url = CVPP_BASE + "?" + urlencode({
         "Query": query, "IncludeExpired": "true", "pageNumber": "1", "pageSize": "100"
     })
-    headers = {"User-Agent": "Mozilla/5.0 Lietuvos-viesieji-pirkimai-paieska/14.0"}
+    headers = {"User-Agent": "Mozilla/5.0 Lietuvos-viesieji-pirkimai-paieska/15.0"}
     try:
         async with httpx.AsyncClient(timeout=_timeout(), follow_redirects=True, headers=headers) as client:
             r = await client.get(url)
@@ -307,7 +313,7 @@ async def search_mano_konkursas(buyer: str, keyword: str, limit: int) -> dict[st
 async def _session_client() -> httpx.AsyncClient:
     client = httpx.AsyncClient(
         timeout=_timeout(), follow_redirects=True, http2=False,
-        headers={"User-Agent": "Mozilla/5.0 Lietuvos-viesieji-pirkimai-paieska/14.0", "Accept": "text/html,application/xhtml+xml,application/pdf,*/*"},
+        headers={"User-Agent": "Mozilla/5.0 Lietuvos-viesieji-pirkimai-paieska/15.0", "Accept": "text/html,application/xhtml+xml,application/pdf,*/*"},
         limits=httpx.Limits(max_keepalive_connections=2, max_connections=3),
     )
     try:
@@ -319,7 +325,7 @@ async def _session_client() -> httpx.AsyncClient:
 
 def _extract_internal_links(page_html: str, base_url: str, resource_id: str) -> list[dict[str, str]]:
     links, seen = [], set()
-    pattern = r'(?is)<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>'
+    pattern = r"""(?is)<a[^>]+href=["']([^"']+)["'][^>]*>(.*?)</a>"""
     for href, label_html in re.findall(pattern, page_html):
         label = _strip_tags(label_html)[:300]
         absolute = urljoin(base_url, html.unescape(href.strip()))
@@ -328,25 +334,23 @@ def _extract_internal_links(page_html: str, base_url: str, resource_id: str) -> 
         seen.add(absolute)
         if "viesiejipirkimai.lt" not in urlparse(absolute).netloc.casefold():
             continue
-        blob = f"{absolute} {label}".casefold()
-        if resource_id not in absolute and not any(x in blob for x in ("notice", "award", "winner", "contract", "result", "document")):
+        low = absolute.casefold()
+        if resource_id not in absolute and "/epps/notices/downloadnoticefores.do?" not in low:
             continue
         links.append({"url": absolute, "label": label})
     return links
 
-
 def _page_role(url: str, label: str = "") -> str:
     blob = f"{url} {label}".casefold()
-    if any(x in blob for x in ("award", "winner", "result")):
+    if "contract award notice" in blob or any(x in blob for x in ("award", "winner", "result")):
         return "rezultatai / laimėtojas"
-    if "contract" in blob and "document" not in blob:
-        return "sutartis / sutarties duomenys"
-    if "document" in blob:
+    if "listcontractdocuments.do" in blob or "document" in blob:
         return "pirkimo dokumentai"
     if "notice" in blob or "skelbim" in blob:
         return "skelbimas"
+    if "contract" in blob and "award" not in blob and "notice" not in blob:
+        return "sutartis / sutarties duomenys"
     return "kitas puslapis"
-
 
 async def inspect_procurement(resource_id: str) -> dict[str, Any]:
     resource_id = str(resource_id).strip()
@@ -392,7 +396,7 @@ async def inspect_procurement(resource_id: str) -> dict[str, Any]:
                             "label": source_label or filename or "Dokumentas",
                             "url": final_url, "final_url": final_url, "filename": filename,
                             "content_type": ctype, "http_status": r.status_code,
-                            "category": _classify(source_label, final_url, filename),
+                            "category": _classify(source_label, final_url, filename, ctype),
                         })
                     continue
 
@@ -405,7 +409,7 @@ async def inspect_procurement(resource_id: str) -> dict[str, Any]:
                         key = f"{absolute}|{label}"
                         if key not in seen_doc_keys:
                             seen_doc_keys.add(key)
-                            documents.append({"label": label or "Dokumentas", "url": absolute, "category": _classify(label, absolute)})
+                            documents.append({"label": label or "Dokumentas", "url": absolute, "category": _classify(label, absolute, "", "")})
 
                 if depth < 2:
                     for link in _extract_internal_links(body, final_url, resource_id):
@@ -425,7 +429,7 @@ async def inspect_procurement(resource_id: str) -> dict[str, Any]:
                 async with httpx.AsyncClient(
                     timeout=_timeout(), follow_redirects=True, http2=False,
                     limits=httpx.Limits(max_keepalive_connections=2, max_connections=3),
-                    headers={"User-Agent": "Mozilla/5.0 Lietuvos-viesieji-pirkimai-paieska/14.0"},
+                    headers={"User-Agent": "Mozilla/5.0 Lietuvos-viesieji-pirkimai-paieska/15.0"},
                 ) as c:
                     r = await c.head(item["url"])
                     if r.status_code in (403, 405):
@@ -439,13 +443,14 @@ async def inspect_procurement(resource_id: str) -> dict[str, Any]:
                         result["final_url"] = str(r.url)
                         result["content_type"] = r.headers.get("content-type", "")
                         result["filename"] = _filename_from_disposition(r.headers.get("content-disposition", ""))
-                result["category"] = _classify(result.get("label", ""), result.get("final_url") or result.get("url", ""), result.get("filename", ""))
+                result["category"] = _classify(result.get("label", ""), result.get("final_url") or result.get("url", ""), result.get("filename", ""), result.get("content_type", ""))
             except Exception as exc:
                 result["probe_error"] = f"{type(exc).__name__}: {exc}"
             result["score"] = _rank_document(result)
             return result
 
     probed = await asyncio.gather(*(probe(x) for x in documents[:MAX_DOC_LINKS]))
+    probed = [x for x in probed if "text/html" not in str(x.get("content_type") or "").casefold()]
     deduped, seen = [], set()
     for item in sorted(probed, key=lambda x: x.get("score", 0), reverse=True):
         key = _norm(item.get("filename")) or _norm(item.get("final_url")) or _norm(item.get("url"))
@@ -467,6 +472,11 @@ async def inspect_procurement(resource_id: str) -> dict[str, Any]:
             "unique_documents": len(deduped),
             "contracts_found": len(contracts),
             "award_documents_found": len(awards),
+            "contract_status": (
+                "Rasta bent viena tikėtina pasirašyta sutartis."
+                if contracts else
+                "Pasirašytos sutarties failas šiame viešame CVP IS kelyje nerastas."
+            ),
         },
     }
 
@@ -603,4 +613,4 @@ async def health(_: Request) -> HTMLResponse:
 if __name__ == "__main__":
     mcp.settings.host = "0.0.0.0"
     mcp.settings.port = int(os.environ.get("PORT", "10000"))
-    mcp.run(transport="streamable-http")
+    mcp.run(transport="streamable-http

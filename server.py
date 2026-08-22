@@ -1,15 +1,4 @@
-import asyncio
-import csv
-import html
-import io
-import json
-import os
-import re
-from dataclasses import dataclass, asdict
-from typing import Any
-from urllib.parse import urlencode, urljoin, urlparse
 
-import httpx
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -35,6 +24,10 @@ SEARCH_BATCH_PAGES = int(os.getenv("SEARCH_BATCH_PAGES", "20"))
 MAX_RESULT_ITEMS = int(os.getenv("MAX_RESULT_ITEMS", "100"))
 MAX_DOC_PAGES = int(os.getenv("MAX_DOC_PAGES", "12"))
 MAX_DOC_LINKS = int(os.getenv("MAX_DOC_LINKS", "40"))
+KRETINGA_AUTHORITY_ID = os.getenv("KRETINGA_AUTHORITY_ID", "3530")
+KRETINGA_ORG_GROUP_ID = os.getenv("KRETINGA_ORG_GROUP_ID", "3627")
+MAX_NOTICE_PAGES = int(os.getenv("MAX_NOTICE_PAGES", "40"))
+
 
 mcp = FastMCP(
     APP_NAME,
@@ -188,7 +181,7 @@ async def _fetch_new_api_page(client: httpx.AsyncClient, page: int) -> Any:
         "Accept": "application/json",
         "Content-Type": "application/json",
         "apiKey": _api_key(),
-        "User-Agent": "lietuvos-viesieji-pirkimai/15.0",
+        "User-Agent": "lietuvos-viesieji-pirkimai/16.0",
     }
     body = {"pageSize": VPT_PAGE_SIZE, "pageNum": page}
     r = await client.post(VPT_API_URL, headers=headers, json=body)
@@ -255,7 +248,7 @@ async def search_old_cvpp(buyer: str, keyword: str, limit: int) -> dict[str, Any
     url = CVPP_BASE + "?" + urlencode({
         "Query": query, "IncludeExpired": "true", "pageNumber": "1", "pageSize": "100"
     })
-    headers = {"User-Agent": "Mozilla/5.0 Lietuvos-viesieji-pirkimai-paieska/15.0"}
+    headers = {"User-Agent": "Mozilla/5.0 Lietuvos-viesieji-pirkimai-paieska/16.0"}
     try:
         async with httpx.AsyncClient(timeout=_timeout(), follow_redirects=True, headers=headers) as client:
             r = await client.get(url)
@@ -313,7 +306,7 @@ async def search_mano_konkursas(buyer: str, keyword: str, limit: int) -> dict[st
 async def _session_client() -> httpx.AsyncClient:
     client = httpx.AsyncClient(
         timeout=_timeout(), follow_redirects=True, http2=False,
-        headers={"User-Agent": "Mozilla/5.0 Lietuvos-viesieji-pirkimai-paieska/15.0", "Accept": "text/html,application/xhtml+xml,application/pdf,*/*"},
+        headers={"User-Agent": "Mozilla/5.0 Lietuvos-viesieji-pirkimai-paieska/16.0", "Accept": "text/html,application/xhtml+xml,application/pdf,*/*"},
         limits=httpx.Limits(max_keepalive_connections=2, max_connections=3),
     )
     try:
@@ -352,6 +345,145 @@ def _page_role(url: str, label: str = "") -> str:
         return "sutartis / sutarties duomenys"
     return "kitas puslapis"
 
+
+def _extract_procurement_title(page_html: str) -> str:
+    text = _strip_tags(page_html)
+    m = re.search(r"Pirkimas:\s*(.+?)(?:Rodyti pirkimo meniu|Pirkimų suvestinės nuoroda:)", text, re.I)
+    if m:
+        return re.sub(r"\s+", " ", m.group(1)).strip()
+    return ""
+
+
+def _title_similarity(a: str, b: str) -> float:
+    aa = set(re.findall(r"\w+", _norm(a)))
+    bb = set(re.findall(r"\w+", _norm(b)))
+    if not aa or not bb:
+        return 0.0
+    return len(aa & bb) / len(aa | bb)
+
+
+async def _find_matching_published_notices(client: httpx.AsyncClient, procurement_title: str) -> list[dict[str, Any]]:
+    if not procurement_title:
+        return []
+
+    matches = []
+    seen = set()
+    row_pattern = re.compile(r"(?is)<tr[^>]*>(.*?)</tr>")
+    link_pattern = re.compile(r"(?is)<a[^>]+href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>")
+
+    for page_no in range(1, MAX_NOTICE_PAGES + 1):
+        url = (
+            f"{CVPIS_BASE}epps/notices/viewPublishedNotices.do?"
+            f"authorityId={KRETINGA_AUTHORITY_ID}&orgGroupId={KRETINGA_ORG_GROUP_ID}"
+            f"&d-446978-p={page_no}&d-446978-s=title.keyword&d-446978-o=2&d-446978-n=1"
+        )
+        try:
+            r = await client.get(url)
+            if r.status_code >= 400:
+                continue
+            body = r.text[:3_000_000]
+        except Exception:
+            continue
+
+        rows = row_pattern.findall(body)
+        if not rows:
+            break
+
+        any_data_row = False
+        for row in rows:
+            row_text = _strip_tags(row)
+            if len(row_text) < 20:
+                continue
+            any_data_row = True
+
+            sim = _title_similarity(procurement_title, row_text)
+            if sim < 0.45 and _norm(procurement_title) not in _norm(row_text):
+                continue
+
+            for href, label_html in link_pattern.findall(row):
+                absolute = urljoin(str(r.url), html.unescape(href.strip()))
+                low = absolute.casefold()
+                if "viewpublishedcontractnotice.do" not in low and "viewpublishednotice" not in low:
+                    continue
+                if absolute in seen:
+                    continue
+                seen.add(absolute)
+
+                kind = "rezultatai / laimėtojas" if "sutarties skyr" in _norm(row_text) else "skelbimas"
+                matches.append({
+                    "url": absolute,
+                    "label": _strip_tags(label_html) or row_text[:180],
+                    "row_text": row_text[:1200],
+                    "similarity": round(sim, 3),
+                    "category": kind,
+                })
+
+        if not any_data_row:
+            break
+
+    matches.sort(
+        key=lambda x: (x.get("category") == "rezultatai / laimėtojas", x.get("similarity", 0)),
+        reverse=True,
+    )
+    return matches[:20]
+
+
+def _extract_award_facts(text: str) -> dict[str, Any]:
+    clean = re.sub(r"\s+", " ", text)
+    out = {}
+
+    for p in (
+        r"(?:Laimėtojas|Konkurso laimėtojas|Pasirinktas tiekėjas).{0,300}?Oficialus pavadinimas:\s*([^|]{2,180})",
+        r"(?:Laimėtojas|Pasirinktas tiekėjas):\s*([^|]{2,180})",
+    ):
+        m = re.search(p, clean, re.I)
+        if m:
+            out["winner"] = m.group(1).strip(" -;,.")
+            break
+
+    for p in (
+        r"(?:Sutarties vertė|Pasiūlymo vertė|Bendra sutarties vertė)[^0-9]{0,60}([0-9][0-9\s.,]+)\s*(?:EUR|Euro)",
+        r"(?:Galutinė vertė|Suteikta vertė)[^0-9]{0,60}([0-9][0-9\s.,]+)\s*(?:EUR|Euro)",
+    ):
+        m = re.search(p, clean, re.I)
+        if m:
+            out["value"] = re.sub(r"\s+", " ", m.group(1)).strip()
+            break
+
+    m = re.search(
+        r"(?:Sutarties sudarymo data|Sutarties pasirašymo data|Sutarties skyrimo data)[^0-9]{0,30}(\d{1,2}[./-]\d{1,2}[./-]\d{4}|\d{4}-\d{2}-\d{2})",
+        clean,
+        re.I,
+    )
+    if m:
+        out["contract_date"] = m.group(1)
+
+    return out
+
+
+async def _inspect_matching_notices(client: httpx.AsyncClient, notices: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    results = []
+    for item in notices[:10]:
+        enriched = dict(item)
+        try:
+            r = await client.get(item["url"])
+            enriched["http_status"] = r.status_code
+            enriched["final_url"] = str(r.url)
+            ctype = r.headers.get("content-type", "")
+            enriched["content_type"] = ctype
+            if r.status_code < 400 and "text/html" in ctype.casefold():
+                body = r.text[:3_000_000]
+                text = _strip_tags(body)
+                enriched["facts"] = _extract_award_facts(text)
+                enriched["text_excerpt"] = text[:3500]
+            else:
+                enriched["facts"] = {}
+        except Exception as exc:
+            enriched["error"] = f"{type(exc).__name__}: {exc}"
+        results.append(enriched)
+    return results
+
+
 async def inspect_procurement(resource_id: str) -> dict[str, Any]:
     resource_id = str(resource_id).strip()
     if not resource_id.isdigit():
@@ -367,6 +499,8 @@ async def inspect_procurement(resource_id: str) -> dict[str, Any]:
     visited, seen_doc_keys = set(), set()
     queued = [(u, 0, "pradinis") for u in seeds]
 
+    matching_notice_links = []
+    matching_notices = []
     client = await _session_client()
     try:
         while queued and len(visited) < MAX_DOC_PAGES:
@@ -401,6 +535,8 @@ async def inspect_procurement(resource_id: str) -> dict[str, Any]:
                     continue
 
                 body = r.text[:2_500_000]
+                if not procurement_title and "prepareviewcftws.do" in final_url.casefold():
+                    procurement_title = _extract_procurement_title(body)
                 pattern = r'(?is)<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>'
                 for href, label_html in re.findall(pattern, body):
                     label = _strip_tags(label_html)[:300]
@@ -418,6 +554,9 @@ async def inspect_procurement(resource_id: str) -> dict[str, Any]:
                             queued.append((link["url"], depth + 1, link["label"] or role))
             except Exception as exc:
                 pages.append({"url": url, "status": "error", "error": f"{type(exc).__name__}: {exc}"})
+
+        matching_notice_links = await _find_matching_published_notices(client, procurement_title)
+        matching_notices = await _inspect_matching_notices(client, matching_notice_links)
     finally:
         await client.aclose()
 
@@ -429,7 +568,7 @@ async def inspect_procurement(resource_id: str) -> dict[str, Any]:
                 async with httpx.AsyncClient(
                     timeout=_timeout(), follow_redirects=True, http2=False,
                     limits=httpx.Limits(max_keepalive_connections=2, max_connections=3),
-                    headers={"User-Agent": "Mozilla/5.0 Lietuvos-viesieji-pirkimai-paieska/15.0"},
+                    headers={"User-Agent": "Mozilla/5.0 Lietuvos-viesieji-pirkimai-paieska/16.0"},
                 ) as c:
                     r = await c.head(item["url"])
                     if r.status_code in (403, 405):
@@ -467,11 +606,14 @@ async def inspect_procurement(resource_id: str) -> dict[str, Any]:
         "documents": deduped,
         "contracts": contracts,
         "award_documents": awards,
+        "published_notices": matching_notices,
+        "procurement_title": procurement_title,
         "summary": {
             "pages_checked": len(pages),
             "unique_documents": len(deduped),
             "contracts_found": len(contracts),
             "award_documents_found": len(awards),
+            "matching_published_notices": len(matching_notices),
             "contract_status": (
                 "Rasta bent viena tikėtina pasirašyta sutartis."
                 if contracts else
@@ -569,7 +711,7 @@ async def procurement_page(request: Request) -> HTMLResponse:
         return HTMLResponse(_page(f'<div class="card error">{html.escape(str(exc))}</div>'), status_code=500)
 
     s = result["summary"]
-    top = f'''<div class="card"><h1>CVP IS pirkimo analizė: {html.escape(resource_id)}</h1><p><span class="badge">Patikrinta puslapių: {s["pages_checked"]}</span><span class="badge">Unikalių dokumentų: {s["unique_documents"]}</span><span class="badge">Sutarčių: {s["contracts_found"]}</span><span class="badge">Rezultatų / laimėtojo dokumentų: {s["award_documents_found"]}</span></p></div>'''
+    top = f'''<div class="card"><h1>CVP IS pirkimo analizė: {html.escape(resource_id)}</h1><p><span class="badge">Patikrinta puslapių: {s["pages_checked"]}</span><span class="badge">Unikalių dokumentų: {s["unique_documents"]}</span><span class="badge">Sutarčių: {s["contracts_found"]}</span><span class="badge">Rezultatų / laimėtojo dokumentų: {s["award_documents_found"]}</span>\n<span class="badge">Atitinkančių paskelbtų pranešimų: {s["matching_published_notices"]}</span></p></div>'''
 
     def render_docs(title: str, docs: list[dict[str, Any]], css: str = "") -> str:
         body = []

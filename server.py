@@ -1,5 +1,7 @@
 import asyncio
+import csv
 import html
+import io
 import json
 import os
 import re
@@ -33,10 +35,22 @@ VPT_API_URL = os.getenv(
     "https://viesiejipirkimai.lt/epps-integration/api/cft-details-export",
 )
 CVPP_BASE_URL = "https://cvpp.eviesiejipirkimai.lt/"
+MANO_KONKURSAS_HOME = "https://www.manokonkursas.lt/"
+MANO_KONKURSAS_EXPORT_URL = os.getenv("MANO_KONKURSAS_EXPORT_URL", "").strip()
+
+DEFAULT_BUYER = "Kretingos rajono savivaldybės administracija"
+DEFAULT_KEYWORDS = [
+    "Rudkasa",
+    "Vakarų verslas",
+    "sniego",
+    "sniego išvežimas",
+    "žiemos priežiūra",
+]
+
 VPT_PAGE_SIZE = 20
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "120"))
-MAX_NEW_PAGES = int(os.getenv("MAX_NEW_PAGES", "250"))
-MAX_CVPP_RESULT_PAGES = int(os.getenv("MAX_CVPP_RESULT_PAGES", "20"))
+MAX_NEW_PAGES = int(os.getenv("MAX_NEW_PAGES", "300"))
+MAX_CVPP_RESULT_PAGES = int(os.getenv("MAX_CVPP_RESULT_PAGES", "30"))
 SEARCH_CONCURRENCY = int(os.getenv("SEARCH_CONCURRENCY", "5"))
 
 
@@ -65,7 +79,10 @@ def _json_records(payload: Any) -> list[Any]:
     if not isinstance(payload, dict):
         return [payload]
 
-    for key in ("content", "items", "results", "data", "records", "procurements", "cfts", "result"):
+    for key in (
+        "content", "items", "results", "data", "records",
+        "procurements", "cfts", "result"
+    ):
         value = payload.get(key)
         if isinstance(value, list):
             return value
@@ -77,22 +94,37 @@ def _json_records(payload: Any) -> list[Any]:
     return [payload]
 
 
-def _matches_text(value: Any, query: str) -> bool:
-    haystack = (
-        json.dumps(value, ensure_ascii=False, default=str)
-        if not isinstance(value, str)
-        else value
-    ).casefold()
-    terms = [x for x in query.casefold().split() if x]
-    return all(term in haystack for term in terms)
+def _text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False, default=str)
 
+
+def _contains_all(value: Any, terms: list[str]) -> bool:
+    haystack = _text(value).casefold()
+    return all(term.casefold() in haystack for term in terms if term.strip())
+
+
+def _contains_any(value: Any, terms: list[str]) -> list[str]:
+    haystack = _text(value).casefold()
+    return [term for term in terms if term.strip() and term.casefold() in haystack]
+
+
+def _keyword_list(raw: str) -> list[str]:
+    values = [x.strip() for x in re.split(r"[,\n;]+", raw or "") if x.strip()]
+    return values or DEFAULT_KEYWORDS
+
+
+# ----------------------------
+# Naujoji CVP IS
+# ----------------------------
 
 async def _fetch_new_page(page: int) -> Any:
     headers = {
         "Accept": "application/json",
         "Content-Type": "application/json",
         "apiKey": _api_key(),
-        "User-Agent": "lietuvos-viesieji-pirkimai/4.0",
+        "User-Agent": "lietuvos-viesieji-pirkimai/6.0",
     }
     body = {"pageSize": VPT_PAGE_SIZE, "pageNum": page}
 
@@ -103,7 +135,9 @@ async def _fetch_new_page(page: int) -> Any:
                 r = await client.post(VPT_API_URL, headers=headers, json=body)
 
             if r.status_code >= 400:
-                raise RuntimeError(f"Naujos CVP IS API HTTP {r.status_code}: {r.text[:800]}")
+                raise RuntimeError(
+                    f"Naujos CVP IS API HTTP {r.status_code}: {r.text[:800]}"
+                )
             return r.json()
 
         except (httpx.TimeoutException, httpx.NetworkError) as exc:
@@ -114,7 +148,11 @@ async def _fetch_new_page(page: int) -> Any:
     raise RuntimeError(f"Nepavyko pasiekti naujos CVP IS API: {last!r}")
 
 
-async def _search_new_cvpis(query: str, limit: int) -> dict[str, Any]:
+async def _search_new_cvpis(
+    buyer: str,
+    keywords: list[str],
+    limit: int,
+) -> dict[str, Any]:
     results = []
     scanned = 0
     pages_scanned = 0
@@ -127,16 +165,14 @@ async def _search_new_cvpis(query: str, limit: int) -> dict[str, Any]:
             except Exception:
                 return page, None
 
-    batch_size = 10
-
-    for start in range(1, MAX_NEW_PAGES + 1, batch_size):
-        pages = list(range(start, min(start + batch_size, MAX_NEW_PAGES + 1)))
+    for start in range(1, MAX_NEW_PAGES + 1, 10):
+        pages = list(range(start, min(start + 10, MAX_NEW_PAGES + 1)))
         batch = await asyncio.gather(*(one(p) for p in pages))
 
         good = 0
         empty_pages = 0
 
-        for page, payload in batch:
+        for _, payload in batch:
             if payload is None:
                 continue
 
@@ -150,16 +186,41 @@ async def _search_new_cvpis(query: str, limit: int) -> dict[str, Any]:
 
             for record in records:
                 scanned += 1
-                if _matches_text(record, query):
-                    results.append({"source": "Nauja CVP IS API", "url": None, "data": record})
-                    if len(results) >= limit:
-                        return {"pages_scanned": pages_scanned, "records_scanned": scanned, "items": results}
+
+                if buyer and not _contains_all(record, [buyer]):
+                    continue
+
+                matched = _contains_any(record, keywords)
+
+                results.append(
+                    {
+                        "source": "Nauja CVP IS API",
+                        "buyer": buyer,
+                        "matched_keywords": matched,
+                        "data": record,
+                    }
+                )
+
+                if len(results) >= limit:
+                    return {
+                        "pages_scanned": pages_scanned,
+                        "records_scanned": scanned,
+                        "items": results,
+                    }
 
         if good and empty_pages == good:
             break
 
-    return {"pages_scanned": pages_scanned, "records_scanned": scanned, "items": results}
+    return {
+        "pages_scanned": pages_scanned,
+        "records_scanned": scanned,
+        "items": results,
+    }
 
+
+# ----------------------------
+# Senasis CVPP
+# ----------------------------
 
 def _cvpp_search_url(query: str, page: int) -> str:
     params = {
@@ -174,12 +235,11 @@ def _cvpp_search_url(query: str, page: int) -> str:
 async def _fetch_cvpp_search_page(query: str, page: int) -> str:
     headers = {
         "Accept": "text/html,application/xhtml+xml",
-        "User-Agent": "Mozilla/5.0 Lietuvos-viesieji-pirkimai-paieska/4.0",
+        "User-Agent": "Mozilla/5.0 Lietuvos-viesieji-pirkimai-paieska/6.0",
     }
-    url = _cvpp_search_url(query, page)
 
     async with httpx.AsyncClient(timeout=_timeout(), follow_redirects=True) as client:
-        r = await client.get(url, headers=headers)
+        r = await client.get(_cvpp_search_url(query, page), headers=headers)
 
     if r.status_code >= 400:
         raise RuntimeError(f"CVPP paieška HTTP {r.status_code}")
@@ -195,7 +255,7 @@ def _absolute_cvpp_url(href: str) -> str:
     return "https://cvpp.eviesiejipirkimai.lt/" + href.lstrip("/")
 
 
-def _extract_cvpp_results(page_html: str, query: str) -> list[dict[str, Any]]:
+def _extract_cvpp_results(page_html: str) -> list[dict[str, Any]]:
     hits = []
     seen = set()
 
@@ -208,6 +268,7 @@ def _extract_cvpp_results(page_html: str, query: str) -> list[dict[str, Any]]:
     for pattern in patterns:
         for href, title_html in re.findall(pattern, page_html):
             url = _absolute_cvpp_url(html.unescape(href))
+
             if url in seen:
                 continue
 
@@ -216,85 +277,207 @@ def _extract_cvpp_results(page_html: str, query: str) -> list[dict[str, Any]]:
                 continue
 
             seen.add(url)
-            hits.append({"source": "Senas CVPP", "title": title, "url": url})
-
-    plain = _strip_tags(page_html)
-    if not hits and _matches_text(plain, query):
-        lower = plain.casefold()
-        q = query.casefold()
-        pos = lower.find(q)
-        if pos < 0:
-            pos = 0
-        snippet = plain[max(0, pos - 350): min(len(plain), pos + 1000)]
-
-        hits.append({
-            "source": "Senas CVPP",
-            "title": f"CVPP paieškos rezultatai pagal „{query}“",
-            "url": _cvpp_search_url(query, 1),
-            "snippet": snippet,
-        })
+            hits.append(
+                {
+                    "source": "Senas CVPP",
+                    "title": title,
+                    "url": url,
+                }
+            )
 
     return hits
 
 
-async def _search_old_cvpp(query: str, limit: int) -> dict[str, Any]:
+async def _search_old_cvpp(
+    buyer: str,
+    keywords: list[str],
+    limit: int,
+) -> dict[str, Any]:
     results = []
     pages_scanned = 0
 
-    for page in range(1, MAX_CVPP_RESULT_PAGES + 1):
-        try:
-            page_html = await _fetch_cvpp_search_page(query, page)
-        except Exception as exc:
+    # Pirmiausia ieškoma pagal pirkėją, po to atskirai pagal raktažodžius.
+    queries = [buyer] + [f"{buyer} {kw}" for kw in keywords]
+
+    seen_urls = set()
+
+    for query in queries:
+        for page in range(1, MAX_CVPP_RESULT_PAGES + 1):
+            try:
+                page_html = await _fetch_cvpp_search_page(query, page)
+            except Exception as exc:
+                return {
+                    "pages_scanned": pages_scanned,
+                    "items": results,
+                    "warning": f"{type(exc).__name__}: {exc}",
+                }
+
+            pages_scanned += 1
+            page_hits = _extract_cvpp_results(page_html)
+
+            if not page_hits and page == 1:
+                break
+
+            for item in page_hits:
+                if item["url"] in seen_urls:
+                    continue
+
+                seen_urls.add(item["url"])
+                matched = _contains_any(item.get("title", ""), keywords)
+                item["buyer"] = buyer
+                item["matched_keywords"] = matched
+                results.append(item)
+
+                if len(results) >= limit:
+                    return {
+                        "pages_scanned": pages_scanned,
+                        "items": results,
+                        "warning": None,
+                    }
+
+    return {
+        "pages_scanned": pages_scanned,
+        "items": results,
+        "warning": None,
+    }
+
+
+# ----------------------------
+# Mano konkursas
+# ----------------------------
+
+def _parse_mano_konkursas_export(text: str, content_type: str) -> list[Any]:
+    ct = (content_type or "").casefold()
+
+    if "json" in ct or text.lstrip().startswith(("{", "[")):
+        payload = json.loads(text)
+        return _json_records(payload)
+
+    return list(csv.DictReader(io.StringIO(text)))
+
+
+async def _search_mano_konkursas(
+    buyer: str,
+    keywords: list[str],
+    limit: int,
+) -> dict[str, Any]:
+    if not MANO_KONKURSAS_EXPORT_URL:
+        return {
+            "items": [],
+            "status": "not_connected",
+            "message": (
+                "„Mano konkursas“ eksportas dar neprijungtas. "
+                "Kai bus gauta eksporto arba oficialios integracijos nuoroda, "
+                "Render aplinkoje nustatykite MANO_KONKURSAS_EXPORT_URL."
+            ),
+        }
+
+    headers = {
+        "Accept": "application/json,text/csv,text/plain,*/*",
+        "User-Agent": "Lietuvos-viesieji-pirkimai-paieska/6.0",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=_timeout(), follow_redirects=True) as client:
+            r = await client.get(MANO_KONKURSAS_EXPORT_URL, headers=headers)
+
+        if r.status_code >= 400:
             return {
-                "pages_scanned": pages_scanned,
-                "items": results,
-                "warning": f"{type(exc).__name__}: {exc}",
+                "items": [],
+                "status": "error",
+                "message": f"„Mano konkursas“ eksportas grąžino HTTP {r.status_code}.",
             }
 
-        pages_scanned += 1
-        page_hits = _extract_cvpp_results(page_html, query)
+        records = _parse_mano_konkursas_export(
+            r.text,
+            r.headers.get("content-type", ""),
+        )
 
-        if not page_hits:
-            if page == 1:
+        hits = []
+
+        for record in records:
+            if buyer and not _contains_all(record, [buyer]):
+                continue
+
+            matched = _contains_any(record, keywords)
+
+            hits.append(
+                {
+                    "source": "Mano konkursas",
+                    "url": MANO_KONKURSAS_HOME,
+                    "buyer": buyer,
+                    "matched_keywords": matched,
+                    "data": record,
+                }
+            )
+
+            if len(hits) >= limit:
                 break
-            continue
 
-        for item in page_hits:
-            results.append(item)
-            if len(results) >= limit:
-                return {"pages_scanned": pages_scanned, "items": results, "warning": None}
+        return {
+            "items": hits,
+            "status": "connected",
+            "message": f"Patikrinta „Mano konkursas“ eksporto įrašų: {len(records)}.",
+        }
 
-    return {"pages_scanned": pages_scanned, "items": results, "warning": None}
+    except Exception as exc:
+        return {
+            "items": [],
+            "status": "error",
+            "message": f"{type(exc).__name__}: {exc}",
+        }
 
 
-async def _search_all(query: str, limit: int = 25) -> dict[str, Any]:
-    if not query.strip():
-        raise ValueError("Paieškos frazė negali būti tuščia.")
+# ----------------------------
+# Bendra paieška
+# ----------------------------
 
-    limit = min(max(int(limit), 1), 100)
+async def _search_all(
+    buyer: str,
+    keywords: list[str],
+    limit: int = 50,
+) -> dict[str, Any]:
+    buyer = buyer.strip() or DEFAULT_BUYER
+    limit = min(max(int(limit), 1), 200)
 
-    new_res, old_res = await asyncio.gather(
-        _search_new_cvpis(query, limit),
-        _search_old_cvpp(query, limit),
+    new_res, old_res, mano_res = await asyncio.gather(
+        _search_new_cvpis(buyer, keywords, limit),
+        _search_old_cvpp(buyer, keywords, limit),
+        _search_mano_konkursas(buyer, keywords, limit),
     )
 
     combined = []
     seen = set()
 
-    for group in (new_res, old_res):
+    for group in (new_res, old_res, mano_res):
         for item in group.get("items", []):
-            signature = item.get("url") or json.dumps(item.get("data", item), ensure_ascii=False, default=str)
+            signature = item.get("url") or json.dumps(
+                item.get("data", item),
+                ensure_ascii=False,
+                default=str,
+            )
+
             if signature in seen:
                 continue
+
             seen.add(signature)
             combined.append(item)
+
             if len(combined) >= limit:
                 break
+
         if len(combined) >= limit:
             break
 
+    # Rezultatai su sutapusiais raktažodžiais keliami į viršų.
+    combined.sort(
+        key=lambda x: len(x.get("matched_keywords", [])),
+        reverse=True,
+    )
+
     return {
-        "query": query,
+        "buyer": buyer,
+        "keywords": keywords,
         "matches": len(combined),
         "items": combined,
         "sources": {
@@ -308,21 +491,27 @@ async def _search_all(query: str, limit: int = 25) -> dict[str, Any]:
                 "matches": len(old_res.get("items", [])),
                 "warning": old_res.get("warning"),
             },
+            "mano_konkursas": {
+                "matches": len(mano_res.get("items", [])),
+                "status": mano_res.get("status"),
+                "message": mano_res.get("message"),
+            },
         },
     }
 
 
 @mcp.tool()
-async def search_procurements(query: str, limit: int = 25) -> str:
-    """Ieškoti naujoje CVP IS ir senajame CVPP."""
-    result = await _search_all(query, limit)
+async def search_procurements(
+    buyer: str = DEFAULT_BUYER,
+    keywords: str = "Rudkasa; Vakarų verslas; sniego; sniego išvežimas; žiemos priežiūra",
+    limit: int = 50,
+) -> str:
+    """
+    Surinkti konkrečios perkančiosios organizacijos pirkimus ir
+    pažymėti įrašus, kuriuose sutampa nurodyti tiekėjai ar raktažodžiai.
+    """
+    result = await _search_all(buyer, _keyword_list(keywords), limit)
     return json.dumps(result, ensure_ascii=False, indent=2, default=str)
-
-
-@mcp.tool()
-async def cvpis_page(page_num: int = 1, page_size: int = 20) -> str:
-    data = await _fetch_new_page(page_num)
-    return json.dumps(data, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
@@ -332,6 +521,8 @@ def procurement_sources() -> str:
             "new_cvpis": "https://viesiejipirkimai.lt/",
             "new_cvpis_api": VPT_API_URL,
             "old_cvpp": CVPP_BASE_URL,
+            "mano_konkursas": MANO_KONKURSAS_HOME,
+            "mano_konkursas_export_connected": bool(MANO_KONKURSAS_EXPORT_URL),
             "vpt": "https://vpt.lrv.lt/",
         },
         ensure_ascii=False,
@@ -350,50 +541,59 @@ body{{font-family:Arial,sans-serif;margin:0;background:#f4f6f8;color:#17212b}}
 main{{max-width:1180px;margin:36px auto;padding:0 20px}}
 .card{{background:#fff;border-radius:14px;padding:24px;box-shadow:0 3px 16px rgba(0,0,0,.08);margin-bottom:20px}}
 h1{{margin-top:0}}
-form{{display:grid;grid-template-columns:1fr 150px 110px;gap:10px}}
-input,button{{font:inherit;padding:12px;border-radius:9px;border:1px solid #bcc5cf}}
+form{{display:grid;grid-template-columns:1fr 1fr 120px;gap:10px}}
+input,textarea,button{{font:inherit;padding:12px;border-radius:9px;border:1px solid #bcc5cf}}
+textarea{{min-height:48px;resize:vertical}}
 button{{background:#111827;color:#fff;cursor:pointer}}
 small{{color:#5b6673;display:block;margin-top:8px}}
 pre{{white-space:pre-wrap;word-break:break-word;background:#f8fafc;padding:14px;border-radius:8px;overflow:auto}}
 .result{{border-top:1px solid #e5e7eb;padding:16px 0}}
+.note{{background:#fff8e1;padding:14px;border-radius:8px}}
 .error{{color:#9b1c1c;background:#fff1f2;padding:14px;border-radius:8px;white-space:pre-wrap}}
 .badge{{display:inline-block;padding:5px 9px;background:#eef2ff;border-radius:999px;margin:3px}}
+.hit{{display:inline-block;padding:4px 8px;background:#dcfce7;border-radius:999px;margin:3px}}
 a{{color:#174ea6}}
-@media(max-width:700px){{form{{grid-template-columns:1fr}}}}
+@media(max-width:800px){{form{{grid-template-columns:1fr}}}}
 </style></head><body><main>{body}</main></body></html>"""
 
 
 @mcp.custom_route("/", methods=["GET"])
 async def web_search(request: Request) -> HTMLResponse:
-    query = (request.query_params.get("q") or "").strip()
+    buyer = (request.query_params.get("buyer") or DEFAULT_BUYER).strip()
+    raw_keywords = (
+        request.query_params.get("keywords")
+        or "Rudkasa; Vakarų verslas; sniego; sniego išvežimas; žiemos priežiūra"
+    )
+    keywords = _keyword_list(raw_keywords)
 
     try:
-        limit = min(max(int(request.query_params.get("limit", "25")), 1), 100)
+        limit = min(max(int(request.query_params.get("limit", "50")), 1), 200)
     except ValueError:
-        limit = 25
+        limit = 50
 
     form = f"""
 <div class="card">
 <h1>Lietuvos viešųjų pirkimų paieška</h1>
-<p>Tikrinama naujoji CVP IS ir tiesioginė senojo CVPP paieška.</p>
+<p>Pirmiausia surenkami pasirinktos perkančiosios organizacijos pirkimai, tada jų viduje ieškoma tiekėjų ir raktažodžių.</p>
 <form method="get" action="/">
-<input name="q" value="{html.escape(query)}"
-       placeholder="Pvz. Rudkasa, Vakarų verslas, Kretingos sniego valymas..." autofocus>
-<input type="number" name="limit" min="1" max="100" value="{limit}" title="Maks. rezultatų">
+<input name="buyer" value="{html.escape(buyer)}" placeholder="Perkančioji organizacija">
+<textarea name="keywords" placeholder="Tiekėjai ir raktažodžiai">{html.escape('; '.join(keywords))}</textarea>
+<input type="number" name="limit" min="1" max="200" value="{limit}" title="Maks. rezultatų">
 <button type="submit">Ieškoti</button>
 </form>
-<small>Senasis CVPP ieškomas tiesiogiai pagal paieškos frazę ir įtraukiant pasibaigusius skelbimus.</small>
+<small>Numatytoji organizacija: Kretingos rajono savivaldybės administracija. Raktažodžiai gali būti atskirti kabliataškiais arba kableliais.</small>
 </div>"""
 
-    if not query:
-        return HTMLResponse(_page(form))
-
     try:
-        result = await _search_all(query, limit)
+        result = await _search_all(buyer, keywords, limit)
     except Exception as exc:
         detail = f"{type(exc).__name__}: {exc}\n\n{exc!r}"
         return HTMLResponse(
-            _page(form + f'<div class="card"><h2>Paieškos klaida</h2><div class="error">{html.escape(detail)}</div></div>'),
+            _page(
+                form
+                + f'<div class="card"><h2>Paieškos klaida</h2>'
+                + f'<div class="error">{html.escape(detail)}</div></div>'
+            ),
             status_code=500,
         )
 
@@ -401,6 +601,7 @@ async def web_search(request: Request) -> HTMLResponse:
     badges = (
         f'<span class="badge">Nauja CVP IS: {s["new_cvpis"]["matches"]}</span>'
         f'<span class="badge">Senas CVPP: {s["old_cvpp"]["matches"]}</span>'
+        f'<span class="badge">Mano konkursas: {s["mano_konkursas"]["matches"]}</span>'
         f'<span class="badge">Iš viso: {result["matches"]}</span>'
     )
 
@@ -410,42 +611,61 @@ async def web_search(request: Request) -> HTMLResponse:
         source = html.escape(str(item.get("source", "")))
         url = item.get("url")
         title = item.get("title")
-        snippet = item.get("snippet")
         data = item.get("data")
+        matched = item.get("matched_keywords", [])
 
         body = f"<p><strong>Šaltinis:</strong> {source}</p>"
+
+        if matched:
+            body += "<p><strong>Sutapo:</strong> " + "".join(
+                f'<span class="hit">{html.escape(str(x))}</span>'
+                for x in matched
+            ) + "</p>"
 
         if title:
             body += f"<p><strong>{html.escape(str(title))}</strong></p>"
 
         if url:
             safe_url = html.escape(str(url), quote=True)
-            body += f'<p><a href="{safe_url}" target="_blank" rel="noopener">Atidaryti pirminį šaltinį</a></p>'
-
-        if snippet:
-            body += f"<p>{html.escape(str(snippet))}</p>"
+            body += (
+                f'<p><a href="{safe_url}" target="_blank" rel="noopener">'
+                f'Atidaryti pirminį šaltinį</a></p>'
+            )
 
         if data is not None:
-            pretty = html.escape(json.dumps(data, ensure_ascii=False, indent=2, default=str))
-            body += f"<pre>{pretty}</pre>"
+            body += "<pre>" + html.escape(
+                json.dumps(data, ensure_ascii=False, indent=2, default=str)
+            ) + "</pre>"
 
-        rows.append(f'<div class="result"><h3>Rezultatas {i}</h3>{body}</div>')
+        rows.append(
+            f'<div class="result"><h3>Rezultatas {i}</h3>{body}</div>'
+        )
 
     if not rows:
         rows.append(
-            "<p>Atitikmenų nerasta. Pabandykite trumpesnį pavadinimo variantą, "
-            "pirkimo numerį, organizaciją arba kitą tiekėjo pavadinimo formą.</p>"
+            "<p>Pasirinktos perkančiosios organizacijos pirkimų prijungtuose šaltiniuose nerasta.</p>"
         )
 
-    warning = s["old_cvpp"].get("warning")
-    warn_html = f'<p class="error">CVPP pastaba: {html.escape(str(warning))}</p>' if warning else ""
+    mano_note = (
+        f'<div class="note"><strong>„Mano konkursas“:</strong> '
+        f'{html.escape(str(s["mano_konkursas"]["message"]))}</div>'
+    )
+
+    cvpp_warning = s["old_cvpp"].get("warning")
+    cvpp_note = (
+        f'<div class="error">CVPP pastaba: {html.escape(str(cvpp_warning))}</div>'
+        if cvpp_warning
+        else ""
+    )
 
     summary = f"""
 <div class="card">
 <h2>Rezultatai</h2>
-<p>Paieška: <strong>{html.escape(query)}</strong></p>
+<p><strong>Perkančioji organizacija:</strong> {html.escape(result["buyer"])}</p>
+<p><strong>Stebimi tiekėjai / raktažodžiai:</strong> {html.escape("; ".join(result["keywords"]))}</p>
 <p>{badges}</p>
-{warn_html}
+{mano_note}
+{cvpp_note}
 {''.join(rows)}
 </div>"""
 
@@ -454,18 +674,24 @@ async def web_search(request: Request) -> HTMLResponse:
 
 @mcp.custom_route("/api/search", methods=["GET"])
 async def api_search(request: Request) -> JSONResponse:
-    query = (request.query_params.get("q") or "").strip()
+    buyer = (request.query_params.get("buyer") or DEFAULT_BUYER).strip()
+    raw_keywords = request.query_params.get("keywords") or ""
+    keywords = _keyword_list(raw_keywords)
 
     try:
-        limit = min(max(int(request.query_params.get("limit", "25")), 1), 100)
+        limit = min(max(int(request.query_params.get("limit", "50")), 1), 200)
     except ValueError:
-        limit = 25
+        limit = 50
 
     try:
-        return JSONResponse(await _search_all(query, limit))
+        return JSONResponse(await _search_all(buyer, keywords, limit))
     except Exception as exc:
         return JSONResponse(
-            {"error": type(exc).__name__, "message": str(exc), "detail": repr(exc)},
+            {
+                "error": type(exc).__name__,
+                "message": str(exc),
+                "detail": repr(exc),
+            },
             status_code=500,
         )
 

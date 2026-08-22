@@ -5,47 +5,51 @@ import io
 import json
 import os
 import re
+from dataclasses import dataclass, asdict
 from typing import Any
-from urllib.parse import urlencode, urljoin
+from urllib.parse import urlencode, urljoin, urlparse
 
 import httpx
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
+from starlette.responses import HTMLResponse, JSONResponse
 
 load_dotenv()
 
+APP_NAME = "Lietuvos viešieji pirkimai"
+DEFAULT_BUYER = "Kretingos rajono savivaldybės administracija"
+
+CVPIS_BASE = "https://viesiejipirkimai.lt/"
+CVPP_BASE = "https://cvpp.eviesiejipirkimai.lt/"
+VPT_API_URL = os.getenv(
+    "VPT_API_URL",
+    "https://viesiejipirkimai.lt/epps-integration/api/cft-details-export",
+)
+MANO_KONKURSAS_EXPORT_URL = os.getenv("MANO_KONKURSAS_EXPORT_URL", "").strip()
+
+HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "75"))
+VPT_PAGE_SIZE = 20
+SEARCH_BATCH_PAGES = int(os.getenv("SEARCH_BATCH_PAGES", "20"))
+MAX_RESULT_ITEMS = int(os.getenv("MAX_RESULT_ITEMS", "100"))
+MAX_DOC_PAGES = int(os.getenv("MAX_DOC_PAGES", "12"))
+MAX_DOC_LINKS = int(os.getenv("MAX_DOC_LINKS", "40"))
+
 mcp = FastMCP(
-    "Lietuvos viešieji pirkimai",
+    APP_NAME,
     transport_security=TransportSecuritySettings(
         allowed_hosts=[
             "lietuvos-viesieji-pirkimai-mcp.onrender.com",
             "lietuvos-viesieji-pirkimai-mcp.onrender.com:*",
         ],
-        allowed_origins=[
-            "https://lietuvos-viesieji-pirkimai-mcp.onrender.com",
-        ],
+        allowed_origins=["https://lietuvos-viesieji-pirkimai-mcp.onrender.com"],
     ),
 )
 
-VPT_API_URL = os.getenv(
-    "VPT_API_URL",
-    "https://viesiejipirkimai.lt/epps-integration/api/cft-details-export",
-)
-CVPIS_BASE = "https://viesiejipirkimai.lt/"
-CVPP_BASE_URL = "https://cvpp.eviesiejipirkimai.lt/"
-MANO_KONKURSAS_HOME = "https://www.manokonkursas.lt/"
-MANO_KONKURSAS_EXPORT_URL = os.getenv("MANO_KONKURSAS_EXPORT_URL", "").strip()
 
-DEFAULT_BUYER = "Kretingos rajono savivaldybės administracija"
-
-VPT_PAGE_SIZE = 20
-HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "90"))
-BATCH_PAGES = int(os.getenv("BATCH_PAGES", "25"))
-SEARCH_CONCURRENCY = int(os.getenv("SEARCH_CONCURRENCY", "5"))
-MAX_CVPP_PAGES_PER_SEARCH = int(os.getenv("MAX_CVPP_PAGES_PER_SEARCH", "10"))
+def _timeout() -> httpx.Timeout:
+    return httpx.Timeout(connect=20.0, read=HTTP_TIMEOUT, write=25.0, pool=20.0)
 
 
 def _api_key() -> str:
@@ -55,27 +59,8 @@ def _api_key() -> str:
     return key
 
 
-def _timeout() -> httpx.Timeout:
-    return httpx.Timeout(connect=20.0, read=HTTP_TIMEOUT, write=30.0, pool=20.0)
-
-
-def _json_records(payload: Any) -> list[Any]:
-    if isinstance(payload, list):
-        return payload
-    if not isinstance(payload, dict):
-        return [payload]
-    for key in (
-        "content", "items", "results", "data", "records",
-        "procurements", "cfts", "result"
-    ):
-        value = payload.get(key)
-        if isinstance(value, list):
-            return value
-        if isinstance(value, dict):
-            nested = _json_records(value)
-            if nested:
-                return nested
-    return [payload]
+def _norm(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "").casefold()).strip()
 
 
 def _text(value: Any) -> str:
@@ -84,179 +69,44 @@ def _text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, default=str)
 
 
-def _normalize(value: str) -> str:
-    return re.sub(r"\s+", " ", value.casefold()).strip()
+def _strip_tags(value: str) -> str:
+    value = re.sub(r"(?is)<script.*?>.*?</script>", " ", value)
+    value = re.sub(r"(?is)<style.*?>.*?</style>", " ", value)
+    value = re.sub(r"(?s)<[^>]+>", " ", value)
+    value = html.unescape(value)
+    return re.sub(r"\s+", " ", value).strip()
 
 
 def _buyer_match(value: Any, buyer: str) -> bool:
-    haystack = _normalize(_text(value))
-    buyer_norm = _normalize(buyer)
-    if buyer_norm in haystack:
+    haystack = _norm(_text(value))
+    target = _norm(buyer)
+    if target in haystack:
         return True
-
-    core_terms = [
-        term for term in re.split(r"\s+", buyer_norm)
-        if len(term) >= 5 and term not in {"rajono", "savivaldybės", "administracija"}
+    terms = [
+        t for t in re.split(r"\s+", target)
+        if len(t) >= 5 and t not in {"rajono", "savivaldybės", "administracija"}
     ]
-    if not core_terms:
-        core_terms = [term for term in re.split(r"\s+", buyer_norm) if len(term) >= 5]
-
-    return all(term in haystack for term in core_terms)
+    return bool(terms) and all(t in haystack for t in terms)
 
 
 def _keyword_match(value: Any, keyword: str) -> bool:
-    if not keyword.strip():
-        return True
-    return _normalize(keyword) in _normalize(_text(value))
+    return not keyword.strip() or _norm(keyword) in _norm(_text(value))
 
 
-async def _fetch_new_page(page: int) -> Any:
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "apiKey": _api_key(),
-        "User-Agent": "lietuvos-viesieji-pirkimai/13.0",
-    }
-    body = {"pageSize": VPT_PAGE_SIZE, "pageNum": page}
-
-    async with httpx.AsyncClient(
-        timeout=_timeout(),
-        follow_redirects=True,
-        http2=False,
-    ) as client:
-        response = await client.post(VPT_API_URL, headers=headers, json=body)
-
-    if response.status_code >= 400:
-        raise RuntimeError(
-            f"CVP IS API HTTP {response.status_code}: {response.text[:800]}"
-        )
-    return response.json()
-
-
-async def _scan_cvpis_batch(
-    buyer: str,
-    keyword: str,
-    start_page: int,
-    pages: int,
-    limit: int,
-) -> dict[str, Any]:
-    semaphore = asyncio.Semaphore(max(1, SEARCH_CONCURRENCY))
-
-    async def one(page: int):
-        async with semaphore:
-            try:
-                return page, await _fetch_new_page(page), None
-            except Exception as exc:
-                return page, None, f"{type(exc).__name__}: {exc}"
-
-    page_numbers = list(range(start_page, start_page + pages))
-    batch = await asyncio.gather(*(one(p) for p in page_numbers))
-
-    results, errors = [], []
-    scanned = pages_ok = 0
-
-    for page_num, payload, error in sorted(batch, key=lambda x: x[0]):
-        if error:
-            errors.append(f"p. {page_num}: {error}")
-            continue
-
-        pages_ok += 1
-        for record in _json_records(payload):
-            scanned += 1
-            if not _buyer_match(record, buyer):
-                continue
-            if not _keyword_match(record, keyword):
-                continue
-
-            results.append({
-                "source": "Nauja CVP IS",
-                "page": page_num,
-                "data": record,
-            })
-            if len(results) >= limit:
-                break
-
-        if len(results) >= limit:
-            break
-
-    return {
-        "source": "Nauja CVP IS",
-        "buyer": buyer,
-        "keyword": keyword,
-        "start_page": start_page,
-        "pages_requested": pages,
-        "pages_ok": pages_ok,
-        "records_scanned": scanned,
-        "matches": len(results),
-        "items": results,
-        "next_page": start_page + pages,
-        "errors": errors[:10],
-    }
-
-
-# ----------------------------
-# CVP IS dokumentų ištraukimas pagal resourceId
-# ----------------------------
-
-def _strip_tags(text: str) -> str:
-    text = re.sub(r"(?is)<script.*?>.*?</script>", " ", text)
-    text = re.sub(r"(?is)<style.*?>.*?</style>", " ", text)
-    text = re.sub(r"(?s)<[^>]+>", " ", text)
-    text = html.unescape(text)
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def _looks_like_document_link(href: str, label: str) -> bool:
-    blob = f"{href} {label}".casefold()
-    indicators = (
-        "download", "document", "attachment", "contract", "sutart",
-        ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".zip", ".7z", ".rar",
-    )
-    return any(x in blob for x in indicators)
-
-
-async def _fetch_html(url: str) -> tuple[str, str]:
-    headers = {
-        "Accept": "text/html,application/xhtml+xml,application/pdf,*/*",
-        "User-Agent": "Mozilla/5.0 Lietuvos-viesieji-pirkimai-paieska/13.0",
-    }
-    async with httpx.AsyncClient(timeout=_timeout(), follow_redirects=True) as client:
-        r = await client.get(url, headers=headers)
-
-    if r.status_code >= 400:
-        raise RuntimeError(f"HTTP {r.status_code}: {url}")
-
-    return r.text, str(r.url)
-
-
-def _extract_links(page_html: str, base_url: str) -> list[dict[str, str]]:
-    out = []
-    seen = set()
-
-    for href, label_html in re.findall(
-        r'(?is)<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
-        page_html,
-    ):
-        href = html.unescape(href.strip())
-        label = _strip_tags(label_html)
-
-        if not href or href.startswith("#") or href.lower().startswith("javascript:"):
-            continue
-
-        absolute = urljoin(base_url, href)
-
-        if absolute in seen:
-            continue
-        seen.add(absolute)
-
-        if _looks_like_document_link(absolute, label):
-            out.append({
-                "label": label or "Dokumentas",
-                "url": absolute,
-            })
-
-    return out
-
+def _json_records(payload: Any) -> list[Any]:
+    if isinstance(payload, list):
+        return payload
+    if not isinstance(payload, dict):
+        return [payload]
+    for key in ("content", "items", "results", "data", "records", "procurements", "cfts", "result"):
+        val = payload.get(key)
+        if isinstance(val, list):
+            return val
+        if isinstance(val, dict):
+            nested = _json_records(val)
+            if nested:
+                return nested
+    return [payload]
 
 
 def _filename_from_disposition(disposition: str) -> str:
@@ -270,866 +120,479 @@ def _filename_from_disposition(disposition: str) -> str:
     return m.group(1).strip() if m else ""
 
 
-async def _probe_document_links(documents: list[dict[str, str]]) -> list[dict[str, Any]]:
-    semaphore = asyncio.Semaphore(3)
-
-    async def probe(item: dict[str, str]) -> dict[str, Any]:
-        async with semaphore:
-            url = item["url"]
-            result = dict(item)
-            headers = {
-                "User-Agent": "Mozilla/5.0 Lietuvos-viesieji-pirkimai-paieska/13.0",
-                "Accept": "*/*",
-            }
-
-            async with httpx.AsyncClient(
-                timeout=_timeout(),
-                follow_redirects=True,
-                headers=headers,
-                http2=False,
-                limits=httpx.Limits(max_keepalive_connections=2, max_connections=3),
-            ) as client:
-                try:
-                    r = await client.head(url)
-                    if r.status_code in (403, 405) or r.status_code >= 500:
-                        async with client.stream("GET", url) as sr:
-                            result["http_status"] = sr.status_code
-                            result["final_url"] = str(sr.url)
-                            result["content_type"] = sr.headers.get("content-type", "")
-                            result["content_length"] = sr.headers.get("content-length", "")
-                            disp = sr.headers.get("content-disposition", "")
-                            result["content_disposition"] = disp
-                            result["filename"] = _filename_from_disposition(disp)
-                    else:
-                        result["http_status"] = r.status_code
-                        result["final_url"] = str(r.url)
-                        result["content_type"] = r.headers.get("content-type", "")
-                        result["content_length"] = r.headers.get("content-length", "")
-                        disp = r.headers.get("content-disposition", "")
-                        result["content_disposition"] = disp
-                        result["filename"] = _filename_from_disposition(disp)
-
-                except Exception as exc:
-                    result["probe_error"] = f"{type(exc).__name__}: {exc}"
-
-            return result
-
-    return await asyncio.gather(*(probe(item) for item in documents[:20]))
+def _is_file_like(url: str, label: str = "") -> bool:
+    blob = f"{url} {label}".casefold()
+    return any(x in blob for x in (
+        ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".zip", ".rar", ".7z",
+        "download", "attachment", "file", "document"
+    ))
 
 
-
-async def _resolve_html_intermediates(documents: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Jei 'dokumento' nuoroda grąžina HTML, atidaro tą puslapį ir ieško tikro failo URL."""
-    semaphore = asyncio.Semaphore(3)
-
-    async def resolve(item: dict[str, Any]) -> dict[str, Any]:
-        async with semaphore:
-            result = dict(item)
-            ctype = str(result.get("content_type") or "").casefold()
-            if "text/html" not in ctype:
-                return result
-
-            url = result.get("final_url") or result.get("url")
-            if not url:
-                return result
-
-            headers = {
-                "User-Agent": "Mozilla/5.0 Lietuvos-viesieji-pirkimai-paieska/13.0",
-                "Accept": "text/html,application/xhtml+xml,*/*",
-            }
-
-            try:
-                async with httpx.AsyncClient(
-                    timeout=_timeout(),
-                    follow_redirects=True,
-                    headers=headers,
-                    http2=False,
-                    limits=httpx.Limits(max_keepalive_connections=2, max_connections=3),
-                ) as client:
-                    r = await client.get(url)
-                    if r.status_code >= 400:
-                        result["resolve_error"] = f"HTTP {r.status_code}"
-                        return result
-
-                    body = r.text[:2_000_000]
-                    candidates = []
-
-                    # <a href>
-                    for href, label_html in re.findall(
-                        r'''(?is)<a[^>]+href=["']([^"']+)["'][^>]*>(.*?)</a>''',
-                        body,
-                    ):
-                        label = _strip_tags(label_html)[:300]
-                        absolute = urljoin(str(r.url), html.unescape(href.strip()))
-                        blob = f"{absolute} {label}".casefold()
-                        if any(x in blob for x in (
-                            ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".zip",
-                            "download", "attachment", "document", "contract", "sutart"
-                        )):
-                            candidates.append((absolute, label))
-
-                    # data-* / onclick / JS
-                    raw = re.findall(
-                        r'''(?is)(?:href|src|data-url|data-href|onclick)\s*=\s*["']([^"']+)["']''',
-                        body,
-                    )
-                    for candidate in raw:
-                        candidate = html.unescape(candidate)
-                        m = re.search(
-                            r'''(https?://[^'"\s)]+|/[^'"\s)]+)''',
-                            candidate,
-                        )
-                        if m:
-                            absolute = urljoin(str(r.url), m.group(1))
-                            blob = absolute.casefold()
-                            if any(x in blob for x in (
-                                ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".zip",
-                                "download", "attachment", "document"
-                            )):
-                                candidates.append((absolute, "Tikras failas"))
-
-                    # Reitinguojam rastus kandidatus.
-                    def rank(pair):
-                        absolute, label = pair
-                        blob = f"{absolute} {label}".casefold()
-                        score = 0
-                        if "sutart" in blob or "contract" in blob:
-                            score += 100
-                        if "simra" in blob:
-                            score += 80
-                        if ".pdf" in blob:
-                            score += 40
-                        if any(ext in blob for ext in (".docx", ".doc", ".xlsx", ".xls", ".zip")):
-                            score += 20
-                        if "download" in blob or "attachment" in blob:
-                            score += 10
-                        return score
-
-                    if candidates:
-                        candidates = sorted(candidates, key=rank, reverse=True)
-                        best_url, best_label = candidates[0]
-                        result["resolved_file_url"] = best_url
-                        result["resolved_label"] = best_label
-                        result["resolved_candidates"] = [
-                            {"url": u, "label": l, "score": rank((u, l))}
-                            for u, l in candidates[:10]
-                        ]
-                    else:
-                        result["resolved_candidates"] = []
-
-            except Exception as exc:
-                result["resolve_error"] = f"{type(exc).__name__}: {exc}"
-
-            return result
-
-    return await asyncio.gather(*(resolve(item) for item in documents[:20]))
+def _classify(label: str, url: str, filename: str = "") -> str:
+    blob = f"{label} {url} {filename}".casefold()
+    if any(x in blob for x in ("sutart", "contract")):
+        return "sutartis"
+    if any(x in blob for x in ("award", "winner", "laimėtoj", "rezultat")):
+        return "rezultatai / laimėtojas"
+    if any(x in blob for x in ("notice", "skelbim")):
+        return "skelbimas"
+    if any(x in blob for x in ("atsakym", "paaiškin", "clarification")):
+        return "paaiškinimas / atsakymas"
+    if any(x in blob for x in ("tdp", "projekt", "technin")):
+        return "techninis dokumentas"
+    return "kitas dokumentas"
 
 
-async def _extract_cvpis_documents(resource_id: str) -> dict[str, Any]:
-    resource_id = str(resource_id).strip()
-    if not resource_id.isdigit():
-        raise ValueError("resourceId turi būti skaičius.")
+def _rank_document(item: dict[str, Any]) -> int:
+    blob = " ".join(str(item.get(k, "")) for k in (
+        "label", "url", "final_url", "filename", "content_type", "category"
+    )).casefold()
+    score = 0
+    category = item.get("category")
+    if category == "sutartis":
+        score += 500
+    elif category == "rezultatai / laimėtojas":
+        score += 250
+    elif category == "skelbimas":
+        score += 80
+    elif category == "paaiškinimas / atsakymas":
+        score += 20
+    elif category == "techninis dokumentas":
+        score += 10
+    if "simra" in blob:
+        score += 120
+    if ".pdf" in blob or "application/pdf" in blob:
+        score += 30
+    if item.get("http_status") == 200:
+        score += 3
+    return score
 
-    # Sąmoningai ribojame gylį ir puslapių skaičių, kad Render Free
-    # instancija nebūtų nužudyta dėl atminties / resursų stokos.
-    seed_urls = [
-        f"{CVPIS_BASE}epps/cft/listContractDocuments.do?resourceId={resource_id}",
-        f"{CVPIS_BASE}epps/cft/prepareViewCfTWS.do?resourceId={resource_id}",
-        f"{CVPIS_BASE}epps/cft/downloadNoticeForAdvSearch.do?resourceId={resource_id}",
-    ]
 
+@dataclass
+class ProcResult:
+    source: str
+    title: str = ""
+    url: str = ""
+    data: Any = None
+    resource_id: str = ""
+
+
+async def _fetch_new_api_page(client: httpx.AsyncClient, page: int) -> Any:
     headers = {
-        "Accept": "text/html,application/xhtml+xml,application/pdf,*/*",
-        "User-Agent": "Mozilla/5.0 Lietuvos-viesieji-pirkimai-paieska/13.0",
-        "Referer": f"{CVPIS_BASE}epps/cft/prepareViewCfTWS.do?resourceId={resource_id}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "apiKey": _api_key(),
+        "User-Agent": "lietuvos-viesieji-pirkimai/14.0",
     }
+    body = {"pageSize": VPT_PAGE_SIZE, "pageNum": page}
+    r = await client.post(VPT_API_URL, headers=headers, json=body)
+    if r.status_code >= 400:
+        raise RuntimeError(f"CVP IS API HTTP {r.status_code}: {r.text[:500]}")
+    return r.json()
 
-    pages = []
-    documents = []
-    seen_docs = set()
-    seen_pages = set()
 
-    # Tik keli konkretūs papildomi puslapiai, o ne neribotas crawl.
-    queue = [(u, 0) for u in seed_urls]
-    MAX_PAGES = 8
-    MAX_DEPTH = 1
+def _extract_resource_id(value: Any) -> str:
+    text = _text(value)
+    for pattern in (
+        r"resourceId[=:186\"'\s]+(\d+)",
+        r'"resourceId"\s*:\s*"?(\d+)"?',
+        r"resourceId=(\d+)",
+    ):
+        m = re.search(pattern, text, re.I)
+        if m:
+            return m.group(1)
+    return ""
 
-    def add_doc(url: str, label: str):
-        absolute = urljoin(CVPIS_BASE, html.unescape(url).strip())
-        if not absolute or absolute in seen_docs:
-            return
-        seen_docs.add(absolute)
-        documents.append({
-            "label": label.strip() or "Dokumentas",
-            "url": absolute,
-        })
 
+async def search_new_cvpis(buyer: str, keyword: str, start_page: int, limit: int) -> dict[str, Any]:
+    sem = asyncio.Semaphore(4)
     async with httpx.AsyncClient(
-        timeout=_timeout(),
-        follow_redirects=True,
-        headers=headers,
-        http2=False,
-        limits=httpx.Limits(max_keepalive_connections=2, max_connections=3),
+        timeout=_timeout(), follow_redirects=True, http2=False,
+        limits=httpx.Limits(max_keepalive_connections=3, max_connections=5),
     ) as client:
-        try:
-            await client.get(f"{CVPIS_BASE}epps/home.do")
-        except Exception:
-            pass
+        async def fetch(page: int):
+            async with sem:
+                try:
+                    return page, await _fetch_new_api_page(client, page), None
+                except Exception as exc:
+                    return page, None, f"{type(exc).__name__}: {exc}"
+        pages = list(range(start_page, start_page + SEARCH_BATCH_PAGES))
+        responses = await asyncio.gather(*(fetch(p) for p in pages))
 
-        while queue and len(seen_pages) < MAX_PAGES:
-            url, depth = queue.pop(0)
-            if url in seen_pages:
+    items, errors = [], []
+    scanned = 0
+    for page, payload, error in responses:
+        if error:
+            errors.append(f"p. {page}: {error}")
+            continue
+        for record in _json_records(payload):
+            scanned += 1
+            if not _buyer_match(record, buyer) or not _keyword_match(record, keyword):
                 continue
-            seen_pages.add(url)
-
-            try:
-                r = await client.get(url)
-                final_url = str(r.url)
-                content_type = r.headers.get("content-type", "")
-                pages.append({
-                    "requested_url": url,
-                    "final_url": final_url,
-                    "status": r.status_code,
-                    "content_type": content_type,
-                })
-
-                if r.status_code >= 400:
-                    continue
-
-                ct = content_type.casefold()
-                if any(x in ct for x in (
-                    "application/pdf",
-                    "application/octet-stream",
-                    "application/vnd",
-                    "application/msword",
-                )):
-                    add_doc(final_url, "Atsisiunčiamas dokumentas")
-                    continue
-
-                # Apsauga nuo labai didelių HTML puslapių.
-                body = r.text[:2_000_000]
-
-                for href, label_html in re.findall(
-                    r'''(?is)<a[^>]+href=["']([^"']+)["'][^>]*>(.*?)</a>''',
-                    body,
-                ):
-                    label = _strip_tags(label_html)[:300]
-                    absolute = urljoin(final_url, html.unescape(href.strip()))
-                    blob = f"{absolute} {label}".casefold()
-
-                    if _looks_like_document_link(absolute, label):
-                        add_doc(absolute, label)
-
-                    if depth < MAX_DEPTH and resource_id in absolute:
-                        if any(x in blob for x in (
-                            "contract", "document", "award", "result",
-                            "attachment", "download",
-                        )):
-                            queue.append((absolute, depth + 1))
-
-            except Exception as exc:
-                pages.append({
-                    "requested_url": url,
-                    "status": "error",
-                    "error": f"{type(exc).__name__}: {exc}",
-                })
-
-
-    documents = await _probe_document_links(documents)
-    documents = await _resolve_html_intermediates(documents)
-
-    def score(item: dict[str, Any]) -> int:
-        blob = " ".join(
-            str(item.get(k, ""))
-            for k in ("label", "url", "final_url", "filename", "content_disposition", "content_type", "resolved_file_url", "resolved_label")
-        ).casefold()
-
-        score_value = 0
-        if "sutart" in blob or "contract" in blob:
-            score_value += 200
-        if item.get("resolved_file_url"):
-            score_value += 150
-        if "simra" in blob:
-            score_value += 120
-        if "award" in blob or "winner" in blob or "result" in blob:
-            score_value += 40
-        if ".pdf" in blob or "application/pdf" in blob:
-            score_value += 30
-        if any(ext in blob for ext in (".docx", ".doc", ".xlsx", ".xls", ".zip")):
-            score_value += 10
-        if "download" in blob or "attachment" in blob:
-            score_value += 5
-        if item.get("http_status") == 200:
-            score_value += 3
-        return score_value
-
-    for item in documents:
-        item["score"] = score(item)
-
-    documents.sort(key=lambda x: x.get("score", 0), reverse=True)
-    likely_contract = documents[0] if documents and documents[0].get("score", 0) >= 100 else None
+            items.append(asdict(ProcResult(
+                source="Nauja CVP IS", data=record, resource_id=_extract_resource_id(record)
+            )))
+            if len(items) >= limit:
+                break
+        if len(items) >= limit:
+            break
 
     return {
-        "resource_id": resource_id,
-        "documents_found": len(documents),
-        "documents": documents,
-        "likely_contract": likely_contract,
-        "pages_checked": pages,
-        "session_crawl": True,
-        "bounded_mode": True,
-        "max_pages": MAX_PAGES,
+        "source": "Nauja CVP IS", "items": items, "matches": len(items),
+        "records_scanned": scanned, "next_page": start_page + SEARCH_BATCH_PAGES,
+        "errors": errors[:10],
     }
 
 
-@mcp.tool()
-async def extract_contract_documents(resource_id: str) -> str:
-    """
-    Pagal CVP IS resourceId bando surasti sutarties ir kitų dokumentų
-    atsisiuntimo nuorodas viešoje CVP IS dalyje.
-    """
-    result = await _extract_cvpis_documents(resource_id)
-    return json.dumps(result, ensure_ascii=False, indent=2)
+async def search_old_cvpp(buyer: str, keyword: str, limit: int) -> dict[str, Any]:
+    query = buyer if not keyword.strip() else f"{buyer} {keyword}"
+    url = CVPP_BASE + "?" + urlencode({
+        "Query": query, "IncludeExpired": "true", "pageNumber": "1", "pageSize": "100"
+    })
+    headers = {"User-Agent": "Mozilla/5.0 Lietuvos-viesieji-pirkimai-paieska/14.0"}
+    try:
+        async with httpx.AsyncClient(timeout=_timeout(), follow_redirects=True, headers=headers) as client:
+            r = await client.get(url)
+        if r.status_code >= 400:
+            raise RuntimeError(f"CVPP HTTP {r.status_code}")
+    except Exception as exc:
+        return {"source": "Senas CVPP", "items": [], "matches": 0, "warning": f"{type(exc).__name__}: {exc}"}
 
-
-# ----------------------------
-# Senasis CVPP
-# ----------------------------
-
-def _cvpp_search_url(query: str, page: int) -> str:
-    params = {
-        "Query": query,
-        "IncludeExpired": "true",
-        "pageNumber": str(page),
-        "pageSize": "100",
-    }
-    return CVPP_BASE_URL + "?" + urlencode(params)
-
-
-async def _fetch_cvpp_page(query: str, page: int) -> str:
-    headers = {
-        "Accept": "text/html,application/xhtml+xml",
-        "User-Agent": "Mozilla/5.0 Lietuvos-viesieji-pirkimai-paieska/13.0",
-    }
-    async with httpx.AsyncClient(timeout=_timeout(), follow_redirects=True) as client:
-        r = await client.get(_cvpp_search_url(query, page), headers=headers)
-    if r.status_code >= 400:
-        raise RuntimeError(f"CVPP paieška HTTP {r.status_code}")
-    return r.text
-
-
-def _absolute_cvpp_url(href: str) -> str:
-    if href.startswith("http://") or href.startswith("https://"):
-        return href
-    if href.startswith("/"):
-        return "https://cvpp.eviesiejipirkimai.lt" + href
-    return "https://cvpp.eviesiejipirkimai.lt/" + href.lstrip("/")
-
-
-def _extract_cvpp_results(page_html: str, keyword: str) -> list[dict[str, Any]]:
-    hits = []
-    seen = set()
-
+    hits, seen = [], set()
+    page = r.text[:3_000_000]
     patterns = [
         r'(?is)<a[^>]+href=["\']([^"\']*Notice/Details/[^"\']+)["\'][^>]*>(.*?)</a>',
         r'(?is)<a[^>]+href=["\']([^"\']*ReportsOrProtocol/Details/[^"\']+)["\'][^>]*>(.*?)</a>',
         r'(?is)<a[^>]+href=["\']([^"\']*Contract/Details/[^"\']+)["\'][^>]*>(.*?)</a>',
     ]
-
     for pattern in patterns:
-        for href, title_html in re.findall(pattern, page_html):
-            url = _absolute_cvpp_url(html.unescape(href))
-            if url in seen:
+        for href, label_html in re.findall(pattern, page):
+            title = _strip_tags(label_html)
+            absolute = urljoin(CVPP_BASE, html.unescape(href))
+            if absolute in seen or (keyword.strip() and _norm(keyword) not in _norm(title)):
                 continue
-
-            title = _strip_tags(title_html)
-            if not title:
-                continue
-
-            if keyword.strip() and _normalize(keyword) not in _normalize(title):
-                continue
-
-            seen.add(url)
-            hits.append({
-                "source": "Senas CVPP",
-                "title": title,
-                "url": url,
-            })
-
-    return hits
-
-
-async def _search_cvpp(buyer: str, keyword: str, limit: int) -> dict[str, Any]:
-    results = []
-    pages_scanned = 0
-    warning = None
-    queries = [buyer] + ([f"{buyer} {keyword}"] if keyword.strip() else [])
-    seen = set()
-
-    for query in queries:
-        for page in range(1, MAX_CVPP_PAGES_PER_SEARCH + 1):
-            try:
-                page_html = await _fetch_cvpp_page(query, page)
-            except Exception as exc:
-                warning = f"{type(exc).__name__}: {exc}"
+            seen.add(absolute)
+            hits.append(asdict(ProcResult(source="Senas CVPP", title=title, url=absolute)))
+            if len(hits) >= limit:
                 break
-
-            pages_scanned += 1
-            hits = _extract_cvpp_results(page_html, keyword)
-
-            if not hits and page == 1:
-                break
-
-            for item in hits:
-                if item["url"] in seen:
-                    continue
-                seen.add(item["url"])
-                results.append(item)
-                if len(results) >= limit:
-                    return {
-                        "source": "Senas CVPP",
-                        "pages_scanned": pages_scanned,
-                        "matches": len(results),
-                        "items": results,
-                        "warning": warning,
-                    }
-
-    return {
-        "source": "Senas CVPP",
-        "pages_scanned": pages_scanned,
-        "matches": len(results),
-        "items": results,
-        "warning": warning,
-    }
+    return {"source": "Senas CVPP", "items": hits, "matches": len(hits), "warning": None}
 
 
-# ----------------------------
-# Mano konkursas
-# ----------------------------
-
-def _parse_mano_export(text: str, content_type: str) -> list[Any]:
-    ct = (content_type or "").casefold()
-    if "json" in ct or text.lstrip().startswith(("{", "[")):
-        payload = json.loads(text)
-        return _json_records(payload)
+def _parse_export(text: str, content_type: str) -> list[Any]:
+    if "json" in (content_type or "").casefold() or text.lstrip().startswith(("{", "[")):
+        return _json_records(json.loads(text))
     return list(csv.DictReader(io.StringIO(text)))
 
 
-async def _search_mano_konkursas(
-    buyer: str,
-    keyword: str,
-    limit: int,
-) -> dict[str, Any]:
+async def search_mano_konkursas(buyer: str, keyword: str, limit: int) -> dict[str, Any]:
     if not MANO_KONKURSAS_EXPORT_URL:
-        return {
-            "source": "Mano konkursas",
-            "status": "not_connected",
-            "matches": 0,
-            "items": [],
-            "message": (
-                "„Mano konkursas“ eksportas dar neprijungtas. "
-                "Kai bus turima oficiali eksporto ar integracijos nuoroda, "
-                "ją galima įrašyti Render aplinkoje kaip MANO_KONKURSAS_EXPORT_URL."
-            ),
-        }
-
-    headers = {
-        "Accept": "application/json,text/csv,text/plain,*/*",
-        "User-Agent": "Lietuvos-viesieji-pirkimai-paieska/13.0",
-    }
-
+        return {"source": "Mano konkursas", "status": "not_connected", "items": [], "matches": 0, "message": "Šaltinis neprijungtas."}
     try:
         async with httpx.AsyncClient(timeout=_timeout(), follow_redirects=True) as client:
-            r = await client.get(MANO_KONKURSAS_EXPORT_URL, headers=headers)
-
+            r = await client.get(MANO_KONKURSAS_EXPORT_URL)
         if r.status_code >= 400:
-            return {
-                "source": "Mano konkursas",
-                "status": "error",
-                "matches": 0,
-                "items": [],
-                "message": f"„Mano konkursas“ eksportas grąžino HTTP {r.status_code}.",
-            }
-
-        records = _parse_mano_export(r.text, r.headers.get("content-type", ""))
+            raise RuntimeError(f"HTTP {r.status_code}")
+        records = _parse_export(r.text, r.headers.get("content-type", ""))
         hits = []
-
-        for record in records:
-            if not _buyer_match(record, buyer):
-                continue
-            if not _keyword_match(record, keyword):
-                continue
-
-            hits.append({
-                "source": "Mano konkursas",
-                "url": MANO_KONKURSAS_HOME,
-                "data": record,
-            })
+        for rec in records:
+            if _buyer_match(rec, buyer) and _keyword_match(rec, keyword):
+                hits.append(asdict(ProcResult(source="Mano konkursas", data=rec)))
             if len(hits) >= limit:
                 break
-
-        return {
-            "source": "Mano konkursas",
-            "status": "connected",
-            "matches": len(hits),
-            "items": hits,
-            "message": f"Patikrinta eksporto įrašų: {len(records)}.",
-        }
-
+        return {"source": "Mano konkursas", "status": "connected", "items": hits, "matches": len(hits), "message": f"Patikrinta įrašų: {len(records)}."}
     except Exception as exc:
-        return {
-            "source": "Mano konkursas",
-            "status": "error",
-            "matches": 0,
-            "items": [],
-            "message": f"{type(exc).__name__}: {exc}",
-        }
+        return {"source": "Mano konkursas", "status": "error", "items": [], "matches": 0, "message": f"{type(exc).__name__}: {exc}"}
 
 
-async def _search_all(
-    buyer: str,
-    keyword: str,
-    start_page: int,
-    limit: int,
-) -> dict[str, Any]:
-    cvpis, cvpp, mano = await asyncio.gather(
-        _scan_cvpis_batch(
-            buyer=buyer,
-            keyword=keyword,
-            start_page=start_page,
-            pages=BATCH_PAGES,
-            limit=limit,
-        ),
-        _search_cvpp(
-            buyer=buyer,
-            keyword=keyword,
-            limit=limit,
-        ),
-        _search_mano_konkursas(
-            buyer=buyer,
-            keyword=keyword,
-            limit=limit,
-        ),
+async def _session_client() -> httpx.AsyncClient:
+    client = httpx.AsyncClient(
+        timeout=_timeout(), follow_redirects=True, http2=False,
+        headers={"User-Agent": "Mozilla/5.0 Lietuvos-viesieji-pirkimai-paieska/14.0", "Accept": "text/html,application/xhtml+xml,application/pdf,*/*"},
+        limits=httpx.Limits(max_keepalive_connections=2, max_connections=3),
     )
+    try:
+        await client.get(urljoin(CVPIS_BASE, "epps/home.do"))
+    except Exception:
+        pass
+    return client
 
-    combined, seen = [], set()
 
-    for group in (cvpis, cvpp, mano):
-        for item in group.get("items", []):
-            signature = item.get("url") or json.dumps(
-                item.get("data", item),
-                ensure_ascii=False,
-                default=str,
-            )
-            if signature in seen:
+def _extract_internal_links(page_html: str, base_url: str, resource_id: str) -> list[dict[str, str]]:
+    links, seen = [], set()
+    pattern = r'(?is)<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>'
+    for href, label_html in re.findall(pattern, page_html):
+        label = _strip_tags(label_html)[:300]
+        absolute = urljoin(base_url, html.unescape(href.strip()))
+        if absolute in seen:
+            continue
+        seen.add(absolute)
+        if "viesiejipirkimai.lt" not in urlparse(absolute).netloc.casefold():
+            continue
+        blob = f"{absolute} {label}".casefold()
+        if resource_id not in absolute and not any(x in blob for x in ("notice", "award", "winner", "contract", "result", "document")):
+            continue
+        links.append({"url": absolute, "label": label})
+    return links
+
+
+def _page_role(url: str, label: str = "") -> str:
+    blob = f"{url} {label}".casefold()
+    if any(x in blob for x in ("award", "winner", "result")):
+        return "rezultatai / laimėtojas"
+    if "contract" in blob and "document" not in blob:
+        return "sutartis / sutarties duomenys"
+    if "document" in blob:
+        return "pirkimo dokumentai"
+    if "notice" in blob or "skelbim" in blob:
+        return "skelbimas"
+    return "kitas puslapis"
+
+
+async def inspect_procurement(resource_id: str) -> dict[str, Any]:
+    resource_id = str(resource_id).strip()
+    if not resource_id.isdigit():
+        raise ValueError("resourceId turi būti skaičius.")
+
+    seeds = [
+        f"{CVPIS_BASE}epps/cft/prepareViewCfTWS.do?resourceId={resource_id}",
+        f"{CVPIS_BASE}epps/cft/listContractDocuments.do?resourceId={resource_id}",
+        f"{CVPIS_BASE}epps/cft/downloadNoticeForAdvSearch.do?resourceId={resource_id}",
+    ]
+
+    pages, documents = [], []
+    visited, seen_doc_keys = set(), set()
+    queued = [(u, 0, "pradinis") for u in seeds]
+
+    client = await _session_client()
+    try:
+        while queued and len(visited) < MAX_DOC_PAGES:
+            url, depth, source_label = queued.pop(0)
+            if url in visited:
                 continue
-            seen.add(signature)
-            combined.append(item)
-            if len(combined) >= limit:
-                break
+            visited.add(url)
+            try:
+                r = await client.get(url)
+                final_url = str(r.url)
+                ctype = r.headers.get("content-type", "")
+                disposition = r.headers.get("content-disposition", "")
+                filename = _filename_from_disposition(disposition)
+                pages.append({
+                    "url": url, "final_url": final_url, "status": r.status_code,
+                    "content_type": ctype, "filename": filename,
+                    "role": _page_role(final_url, source_label),
+                })
+                if r.status_code >= 400:
+                    continue
 
+                if "text/html" not in ctype.casefold():
+                    key = filename or final_url
+                    if key not in seen_doc_keys:
+                        seen_doc_keys.add(key)
+                        documents.append({
+                            "label": source_label or filename or "Dokumentas",
+                            "url": final_url, "final_url": final_url, "filename": filename,
+                            "content_type": ctype, "http_status": r.status_code,
+                            "category": _classify(source_label, final_url, filename),
+                        })
+                    continue
+
+                body = r.text[:2_500_000]
+                pattern = r'(?is)<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>'
+                for href, label_html in re.findall(pattern, body):
+                    label = _strip_tags(label_html)[:300]
+                    absolute = urljoin(final_url, html.unescape(href.strip()))
+                    if _is_file_like(absolute, label):
+                        key = f"{absolute}|{label}"
+                        if key not in seen_doc_keys:
+                            seen_doc_keys.add(key)
+                            documents.append({"label": label or "Dokumentas", "url": absolute, "category": _classify(label, absolute)})
+
+                if depth < 2:
+                    for link in _extract_internal_links(body, final_url, resource_id):
+                        role = _page_role(link["url"], link["label"])
+                        if role in ("rezultatai / laimėtojas", "sutartis / sutarties duomenys", "pirkimo dokumentai", "skelbimas"):
+                            queued.append((link["url"], depth + 1, link["label"] or role))
+            except Exception as exc:
+                pages.append({"url": url, "status": "error", "error": f"{type(exc).__name__}: {exc}"})
+    finally:
+        await client.aclose()
+
+    sem = asyncio.Semaphore(3)
+    async def probe(item: dict[str, Any]) -> dict[str, Any]:
+        result = dict(item)
+        async with sem:
+            try:
+                async with httpx.AsyncClient(
+                    timeout=_timeout(), follow_redirects=True, http2=False,
+                    limits=httpx.Limits(max_keepalive_connections=2, max_connections=3),
+                    headers={"User-Agent": "Mozilla/5.0 Lietuvos-viesieji-pirkimai-paieska/14.0"},
+                ) as c:
+                    r = await c.head(item["url"])
+                    if r.status_code in (403, 405):
+                        async with c.stream("GET", item["url"]) as sr:
+                            result["http_status"] = sr.status_code
+                            result["final_url"] = str(sr.url)
+                            result["content_type"] = sr.headers.get("content-type", "")
+                            result["filename"] = _filename_from_disposition(sr.headers.get("content-disposition", ""))
+                    else:
+                        result["http_status"] = r.status_code
+                        result["final_url"] = str(r.url)
+                        result["content_type"] = r.headers.get("content-type", "")
+                        result["filename"] = _filename_from_disposition(r.headers.get("content-disposition", ""))
+                result["category"] = _classify(result.get("label", ""), result.get("final_url") or result.get("url", ""), result.get("filename", ""))
+            except Exception as exc:
+                result["probe_error"] = f"{type(exc).__name__}: {exc}"
+            result["score"] = _rank_document(result)
+            return result
+
+    probed = await asyncio.gather(*(probe(x) for x in documents[:MAX_DOC_LINKS]))
+    deduped, seen = [], set()
+    for item in sorted(probed, key=lambda x: x.get("score", 0), reverse=True):
+        key = _norm(item.get("filename")) or _norm(item.get("final_url")) or _norm(item.get("url"))
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+
+    contracts = [x for x in deduped if x.get("category") == "sutartis"][:10]
+    awards = [x for x in deduped if x.get("category") == "rezultatai / laimėtojas"][:10]
     return {
-        "buyer": buyer,
-        "keyword": keyword,
-        "matches": len(combined),
-        "items": combined,
-        "next_page": cvpis["next_page"],
-        "sources": {
-            "cvpis": cvpis,
-            "cvpp": cvpp,
-            "mano_konkursas": mano,
+        "resource_id": resource_id,
+        "pages_checked": pages,
+        "documents": deduped,
+        "contracts": contracts,
+        "award_documents": awards,
+        "summary": {
+            "pages_checked": len(pages),
+            "unique_documents": len(deduped),
+            "contracts_found": len(contracts),
+            "award_documents_found": len(awards),
         },
     }
 
 
-@mcp.tool()
-async def search_administration_documents(
-    buyer: str = DEFAULT_BUYER,
-    keyword: str = "",
-    start_page: int = 1,
-    limit: int = 50,
-) -> str:
-    result = await _search_all(
-        buyer=buyer.strip() or DEFAULT_BUYER,
-        keyword=keyword.strip(),
-        start_page=max(1, int(start_page)),
-        limit=max(1, min(int(limit), 200)),
+async def search_all(buyer: str, keyword: str, start_page: int, limit: int) -> dict[str, Any]:
+    new, old, mano = await asyncio.gather(
+        search_new_cvpis(buyer, keyword, start_page, limit),
+        search_old_cvpp(buyer, keyword, limit),
+        search_mano_konkursas(buyer, keyword, limit),
     )
+    combined, seen = [], set()
+    for group in (new, old, mano):
+        for item in group.get("items", []):
+            key = item.get("url") or item.get("resource_id") or _text(item.get("data"))
+            key = _norm(key)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            combined.append(item)
+            if len(combined) >= limit:
+                break
+    return {
+        "buyer": buyer, "keyword": keyword, "items": combined, "matches": len(combined),
+        "next_page": new.get("next_page", start_page + SEARCH_BATCH_PAGES),
+        "sources": {"cvpis": new, "cvpp": old, "mano_konkursas": mano},
+    }
+
+
+@mcp.tool()
+async def search_administration_documents(buyer: str = DEFAULT_BUYER, keyword: str = "", start_page: int = 1, limit: int = 50) -> str:
+    result = await search_all(buyer.strip() or DEFAULT_BUYER, keyword.strip(), max(1, int(start_page)), max(1, min(int(limit), MAX_RESULT_ITEMS)))
     return json.dumps(result, ensure_ascii=False, indent=2, default=str)
 
 
+@mcp.tool()
+async def inspect_procurement_documents(resource_id: str) -> str:
+    return json.dumps(await inspect_procurement(resource_id), ensure_ascii=False, indent=2, default=str)
+
+
 def _page(body: str) -> str:
-    return f"""<!doctype html>
-<html lang="lt"><head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Kretingos administracijos pirkimų paieška</title>
-<style>
-body{{font-family:Arial,sans-serif;margin:0;background:#f4f6f8;color:#17212b}}
-main{{max-width:1180px;margin:36px auto;padding:0 20px}}
-.card{{background:#fff;border-radius:14px;padding:24px;box-shadow:0 3px 16px rgba(0,0,0,.08);margin-bottom:20px}}
-h1{{margin-top:0}}
-form{{display:grid;grid-template-columns:1fr 1fr 120px;gap:10px}}
-input,button{{font:inherit;padding:12px;border-radius:9px;border:1px solid #bcc5cf}}
-button{{background:#111827;color:#fff;cursor:pointer}}
-small{{color:#5b6673;display:block;margin-top:8px}}
-pre{{white-space:pre-wrap;word-break:break-word;background:#f8fafc;padding:14px;border-radius:8px;overflow:auto}}
-.result{{border-top:1px solid #e5e7eb;padding:16px 0}}
-.badge{{display:inline-block;padding:5px 9px;background:#eef2ff;border-radius:999px;margin:3px}}
-.note{{background:#fff8e1;padding:14px;border-radius:8px}}
-.error{{color:#9b1c1c;background:#fff1f2;padding:14px;border-radius:8px;white-space:pre-wrap}}
-.actions{{display:flex;gap:10px;flex-wrap:wrap;margin-top:16px}}
-a.button{{display:inline-block;text-decoration:none;background:#334155;color:white;padding:11px 14px;border-radius:9px}}
-.doc{{padding:10px 0;border-bottom:1px solid #e5e7eb}}
-@media(max-width:800px){{form{{grid-template-columns:1fr}}}}
-</style></head><body><main>{body}</main></body></html>"""
+    return f'''<!doctype html><html lang="lt"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Lietuvos viešųjų pirkimų paieška</title><style>
+body{{font-family:Arial,sans-serif;margin:0;background:#f4f6f8;color:#17212b}}main{{max-width:1180px;margin:34px auto;padding:0 20px}}.card{{background:#fff;border-radius:14px;padding:24px;box-shadow:0 3px 16px rgba(0,0,0,.08);margin-bottom:20px}}h1,h2{{margin-top:0}}form{{display:grid;grid-template-columns:1fr 1fr 120px;gap:10px}}input,button{{font:inherit;padding:12px;border-radius:9px;border:1px solid #bcc5cf}}button,.button{{background:#111827;color:#fff;cursor:pointer;text-decoration:none;display:inline-block;padding:11px 14px;border-radius:9px}}small{{color:#5b6673;display:block;margin-top:8px}}pre{{white-space:pre-wrap;word-break:break-word;background:#f8fafc;padding:14px;border-radius:8px;overflow:auto}}.result{{border-top:1px solid #e5e7eb;padding:16px 0}}.badge{{display:inline-block;padding:5px 9px;background:#eef2ff;border-radius:999px;margin:3px}}.good{{background:#ecfdf5}}.note{{background:#fff8e1}}.error{{background:#fff1f2;color:#9b1c1c}}.doc{{padding:12px 0;border-bottom:1px solid #e5e7eb}}@media(max-width:800px){{form{{grid-template-columns:1fr}}}}</style></head><body><main>{body}</main></body></html>'''
 
 
 @mcp.custom_route("/", methods=["GET"])
-async def web_search(request: Request) -> HTMLResponse:
+async def home(request: Request) -> HTMLResponse:
     buyer = (request.query_params.get("buyer") or DEFAULT_BUYER).strip()
     keyword = (request.query_params.get("keyword") or "").strip()
-
+    run = request.query_params.get("run") == "1"
     try:
         start_page = max(1, int(request.query_params.get("start_page", "1")))
     except ValueError:
         start_page = 1
 
-    try:
-        limit = max(1, min(int(request.query_params.get("limit", "50")), 200))
-    except ValueError:
-        limit = 50
-
-    run_search = request.query_params.get("run") == "1"
-
-    form = f"""
-<div class="card">
-<h1>Kretingos rajono savivaldybės administracijos pirkimų paieška</h1>
-<p>Ieškoma pagal perkančiąją organizaciją. Papildomas raktažodis neprivalomas.</p>
-<form method="get" action="/">
-<input name="buyer" value="{html.escape(buyer)}" placeholder="Perkančioji organizacija">
-<input name="keyword" value="{html.escape(keyword)}" placeholder="Papildomas raktažodis, jei reikia">
-<input type="number" name="limit" min="1" max="200" value="{limit}" title="Maks. rezultatų">
-<input type="hidden" name="start_page" value="1">
-<input type="hidden" name="run" value="1">
-<button type="submit">Ieškoti</button>
-</form>
-<small>Jei papildomo raktažodžio neįrašysite, bus ieškoma visų rastų Administracijos pirkimų ir dokumentų.</small>
-</div>
-
-<div class="card">
-<h2>Ištraukti CVP IS pirkimo dokumentus</h2>
-<form method="get" action="/documents">
-<input name="resource_id" placeholder="CVP IS resourceId, pvz. 2722748">
-<div></div><div></div>
-<button type="submit">Ištraukti dokumentus</button>
-</form>
-<small>Įrankis surenka CVP IS nuorodas, atpažįsta HTML tarpinius puslapius, iš jų ištraukia tikrus failų URL ir viršuje iškelia labiausiai tikėtiną sutartį.</small>
-</div>"""
-
-    if not run_search:
+    form = f'''<div class="card"><h1>Lietuvos viešųjų pirkimų paieška</h1><p>Pirmiausia ieškoma pagal perkančiąją organizaciją. Raktažodis neprivalomas.</p><form method="get"><input name="buyer" value="{html.escape(buyer)}"><input name="keyword" value="{html.escape(keyword)}" placeholder="Papildomas raktažodis"><input type="number" name="limit" value="50" min="1" max="{MAX_RESULT_ITEMS}"><input type="hidden" name="start_page" value="{start_page}"><input type="hidden" name="run" value="1"><button>Ieškoti</button></form></div>
+<div class="card"><h2>Išanalizuoti konkretų CVP IS pirkimą</h2><form method="get" action="/procurement"><input name="resource_id" placeholder="resourceId, pvz. 2722748"><div></div><div></div><button>Analizuoti visą pirkimą</button></form><small>Analizuojami skelbimai, pirkimo dokumentai, rezultatų / laimėtojo ir sutarties puslapiai. Nuorodos deduplikuojamos.</small></div>'''
+    if not run:
         return HTMLResponse(_page(form))
-
     try:
-        result = await _search_all(
-            buyer=buyer,
-            keyword=keyword,
-            start_page=start_page,
-            limit=limit,
-        )
+        limit = max(1, min(int(request.query_params.get("limit", "50")), MAX_RESULT_ITEMS))
+        result = await search_all(buyer, keyword, start_page, limit)
     except Exception as exc:
-        return HTMLResponse(
-            _page(
-                form
-                + f'<div class="card"><h2>Paieškos klaida</h2>'
-                + f'<div class="error">{html.escape(type(exc).__name__ + ": " + str(exc))}</div></div>'
-            ),
-            status_code=500,
-        )
-
-    s = result["sources"]
-    badges = (
-        f'<span class="badge">Nauja CVP IS: {s["cvpis"]["matches"]}</span>'
-        f'<span class="badge">Senas CVPP: {s["cvpp"]["matches"]}</span>'
-        f'<span class="badge">Mano konkursas: {s["mano_konkursas"]["matches"]}</span>'
-        f'<span class="badge">Iš viso: {result["matches"]}</span>'
-    )
+        return HTMLResponse(_page(form + f'<div class="card error">{html.escape(str(exc))}</div>'), status_code=500)
 
     rows = []
     for i, item in enumerate(result["items"], 1):
-        source = html.escape(str(item.get("source", "")))
+        title = html.escape(str(item.get("title") or "Pirkimas"))
+        source = html.escape(str(item.get("source") or ""))
+        rid = str(item.get("resource_id") or "")
         body = f"<p><strong>Šaltinis:</strong> {source}</p>"
-
-        if item.get("title"):
-            body += f"<p><strong>{html.escape(str(item['title']))}</strong></p>"
-
         if item.get("url"):
-            safe_url = html.escape(str(item["url"]), quote=True)
-            body += (
-                f'<p><a href="{safe_url}" target="_blank" rel="noopener">'
-                f'Atidaryti pirminį šaltinį</a></p>'
-            )
-
+            body += f'<p><a href="{html.escape(item["url"], quote=True)}" target="_blank">Atidaryti šaltinį</a></p>'
+        if rid:
+            body += f'<p><a class="button" href="/procurement?resource_id={html.escape(rid)}">Analizuoti dokumentus</a></p>'
         if item.get("data") is not None:
-            body += "<pre>" + html.escape(
-                json.dumps(item["data"], ensure_ascii=False, indent=2, default=str)
-            ) + "</pre>"
-
-        rows.append(f'<div class="result"><h3>Rezultatas {i}</h3>{body}</div>')
-
-    if not rows:
-        rows.append("<p>Šiame etape atitikmenų nerasta.</p>")
-
-    notes = []
-
-    if s["mano_konkursas"]["status"] != "connected":
-        notes.append(
-            f'<div class="note"><strong>„Mano konkursas“:</strong> '
-            f'{html.escape(str(s["mano_konkursas"]["message"]))}</div>'
-        )
-
-    if s["cvpp"].get("warning"):
-        notes.append(
-            f'<div class="error"><strong>CVPP:</strong> '
-            f'{html.escape(str(s["cvpp"]["warning"]))}</div>'
-        )
-
-    if s["cvpis"]["errors"]:
-        notes.append(
-            '<div class="note"><strong>CVP IS:</strong> '
-            + "<br>".join(html.escape(x) for x in s["cvpis"]["errors"])
-            + "</div>"
-        )
-
-    next_url = (
-        "/?"
-        + urlencode(
-            {
-                "buyer": buyer,
-                "keyword": keyword,
-                "limit": str(limit),
-                "start_page": str(result["next_page"]),
-                "run": "1",
-            }
-        )
-    )
-
-    summary = f"""
-<div class="card">
-<h2>Rezultatai</h2>
-<p><strong>Perkančioji organizacija:</strong> {html.escape(buyer)}</p>
-<p><strong>Papildomas raktažodis:</strong> {html.escape(keyword) if keyword else "nenaudojamas"}</p>
-<p>{badges}</p>
-{''.join(notes)}
-{''.join(rows)}
-<div class="actions">
-<a class="button" href="{html.escape(next_url, quote=True)}">Ieškoti toliau nuo {result["next_page"]} psl.</a>
-<a class="button" href="/">Nauja paieška</a>
-</div>
-</div>"""
-
+            body += "<pre>" + html.escape(json.dumps(item["data"], ensure_ascii=False, indent=2, default=str)) + "</pre>"
+        rows.append(f'<div class="result"><h3>{i}. {title}</h3>{body}</div>')
+    summary = f'''<div class="card"><h2>Rezultatai</h2><p><span class="badge">Nauja CVP IS: {result["sources"]["cvpis"]["matches"]}</span><span class="badge">Senas CVPP: {result["sources"]["cvpp"]["matches"]}</span><span class="badge">Mano konkursas: {result["sources"]["mano_konkursas"]["matches"]}</span><span class="badge">Iš viso: {result["matches"]}</span></p>{''.join(rows) if rows else '<p>Atitikmenų nerasta.</p>'}</div>'''
     return HTMLResponse(_page(form + summary))
 
 
-@mcp.custom_route("/documents", methods=["GET"])
-async def documents_page(request: Request) -> HTMLResponse:
+@mcp.custom_route("/procurement", methods=["GET"])
+async def procurement_page(request: Request) -> HTMLResponse:
     resource_id = (request.query_params.get("resource_id") or "").strip()
-
     if not resource_id:
-        return RedirectResponse("/")
-
+        return HTMLResponse(_page('<div class="card error">Nenurodytas resourceId.</div>'), status_code=400)
     try:
-        result = await _extract_cvpis_documents(resource_id)
+        result = await inspect_procurement(resource_id)
     except Exception as exc:
-        return HTMLResponse(
-            _page(
-                f'<div class="card"><h1>Dokumentų ištraukimas</h1>'
-                f'<div class="error">{html.escape(type(exc).__name__ + ": " + str(exc))}</div>'
-                f'<p><a href="/">Grįžti</a></p></div>'
-            ),
-            status_code=500,
-        )
+        return HTMLResponse(_page(f'<div class="card error">{html.escape(str(exc))}</div>'), status_code=500)
 
-    docs = []
-    likely_url = (result.get("likely_contract") or {}).get("url")
+    s = result["summary"]
+    top = f'''<div class="card"><h1>CVP IS pirkimo analizė: {html.escape(resource_id)}</h1><p><span class="badge">Patikrinta puslapių: {s["pages_checked"]}</span><span class="badge">Unikalių dokumentų: {s["unique_documents"]}</span><span class="badge">Sutarčių: {s["contracts_found"]}</span><span class="badge">Rezultatų / laimėtojo dokumentų: {s["award_documents_found"]}</span></p></div>'''
 
-    for i, doc in enumerate(result["documents"], 1):
-        label = html.escape(doc.get("label", "Dokumentas"))
-        url = html.escape(doc["url"], quote=True)
-        filename = html.escape(str(doc.get("filename") or ""))
-        content_type = html.escape(str(doc.get("content_type") or ""))
-        status = html.escape(str(doc.get("http_status") or ""))
-        score = html.escape(str(doc.get("score") or ""))
+    def render_docs(title: str, docs: list[dict[str, Any]], css: str = "") -> str:
+        body = []
+        for i, d in enumerate(docs, 1):
+            filename = html.escape(str(d.get("filename") or ""))
+            label = html.escape(str(d.get("label") or "Dokumentas"))
+            category = html.escape(str(d.get("category") or ""))
+            url = html.escape(str(d.get("final_url") or d.get("url") or ""), quote=True)
+            meta = []
+            if filename:
+                meta.append(f"<strong>Failas:</strong> {filename}")
+            meta.append(f"<strong>Kategorija:</strong> {category}")
+            if d.get("content_type"):
+                meta.append(f"<strong>Tipas:</strong> {html.escape(str(d['content_type']))}")
+            body.append(f'<div class="doc"><strong>{i}. {label}</strong><br>' + "<br>".join(meta) + (f'<br><a href="{url}" target="_blank">Atidaryti dokumentą</a>' if url else "") + "</div>")
+        return f'<div class="card {css}"><h2>{title}</h2>{"".join(body) if body else "<p>Nerasta.</p>"}</div>'
 
-        likely = ""
-        if likely_url and doc.get("url") == likely_url:
-            likely = '<div class="note"><strong>Labiausiai tikėtina sutartis</strong></div>'
-
-        meta = []
-        if filename:
-            meta.append(f"<strong>Failas:</strong> {filename}")
-        if content_type:
-            meta.append(f"<strong>Tipas:</strong> {content_type}")
-        resolved_url_raw = str(doc.get("resolved_file_url") or "")
-        resolved_url = html.escape(resolved_url_raw, quote=True)
-        resolved_label = html.escape(str(doc.get("resolved_label") or ""))
-
-        if status:
-            meta.append(f"<strong>HTTP:</strong> {status}")
-        if score:
-            meta.append(f"<strong>Prioritetas:</strong> {score}")
-        if resolved_url_raw:
-            meta.append(f"<strong>Rastas tikras failas:</strong> {resolved_label or 'failas'}")
-
-        links = [f'<a href="{url}" target="_blank" rel="noopener">Atidaryti tarpinį puslapį</a>']
-        if resolved_url_raw:
-            links.insert(
-                0,
-                f'<a href="{resolved_url}" target="_blank" rel="noopener"><strong>Atidaryti tikrą failą</strong></a>'
-            )
-
-        docs.append(
-            f'<div class="doc">{likely}<strong>{i}. {label}</strong><br>'
-            + ("<br>".join(meta) + "<br>" if meta else "")
-            + "<br>".join(links)
-            + "</div>"
-        )
-
-    if not docs:
-        docs.append(
-            "<p>Viešų atsisiuntimo nuorodų automatiškai nerasta. "
-            "Žemiau parodyta, kuriuos CVP IS puslapius pavyko patikrinti.</p>"
-        )
-
-    pages = html.escape(
-        json.dumps(result["pages_checked"], ensure_ascii=False, indent=2)
-    )
-
-    body = f"""
-<div class="card">
-<h1>CVP IS dokumentai: resourceId {html.escape(resource_id)}</h1>
-<p><strong>Rasta dokumentų nuorodų:</strong> {result["documents_found"]}</p>
-{''.join(docs)}
-<h3>Techninė patikra</h3>
-<pre>{pages}</pre>
-<p><a href="/">Grįžti į paiešką</a></p>
-</div>"""
-    return HTMLResponse(_page(body))
+    sections = [
+        render_docs("Sutartys", result["contracts"], "good"),
+        render_docs("Rezultatai / laimėtojas", result["award_documents"], "note"),
+        render_docs("Visi unikalūs dokumentai", result["documents"]),
+        f'<div class="card"><h2>Techninė eiga</h2><pre>{html.escape(json.dumps(result["pages_checked"], ensure_ascii=False, indent=2))}</pre></div>',
+    ]
+    return HTMLResponse(_page(top + "".join(sections)))
 
 
-@mcp.custom_route("/api/documents", methods=["GET"])
-async def documents_api(request: Request) -> JSONResponse:
+@mcp.custom_route("/api/procurement", methods=["GET"])
+async def procurement_api(request: Request) -> JSONResponse:
     resource_id = (request.query_params.get("resource_id") or "").strip()
     try:
-        return JSONResponse(await _extract_cvpis_documents(resource_id))
+        return JSONResponse(await inspect_procurement(resource_id))
     except Exception as exc:
-        return JSONResponse(
-            {
-                "error": type(exc).__name__,
-                "message": str(exc),
-                "detail": repr(exc),
-            },
-            status_code=500,
-        )
+        return JSONResponse({"error": type(exc).__name__, "message": str(exc)}, status_code=500)
 
 
 @mcp.custom_route("/health", methods=["GET"])

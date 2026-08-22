@@ -115,7 +115,7 @@ async def _fetch_new_page(page: int) -> Any:
         "Accept": "application/json",
         "Content-Type": "application/json",
         "apiKey": _api_key(),
-        "User-Agent": "lietuvos-viesieji-pirkimai/9.0",
+        "User-Agent": "lietuvos-viesieji-pirkimai/10.0",
     }
     body = {"pageSize": VPT_PAGE_SIZE, "pageNum": page}
 
@@ -218,7 +218,7 @@ def _looks_like_document_link(href: str, label: str) -> bool:
 async def _fetch_html(url: str) -> tuple[str, str]:
     headers = {
         "Accept": "text/html,application/xhtml+xml,application/pdf,*/*",
-        "User-Agent": "Mozilla/5.0 Lietuvos-viesieji-pirkimai-paieska/9.0",
+        "User-Agent": "Mozilla/5.0 Lietuvos-viesieji-pirkimai-paieska/10.0",
     }
     async with httpx.AsyncClient(timeout=_timeout(), follow_redirects=True) as client:
         r = await client.get(url, headers=headers)
@@ -263,59 +263,142 @@ async def _extract_cvpis_documents(resource_id: str) -> dict[str, Any]:
     if not resource_id.isdigit():
         raise ValueError("resourceId turi būti skaičius.")
 
-    candidate_pages = [
+    seed_urls = [
         f"{CVPIS_BASE}epps/cft/listContractDocuments.do?resourceId={resource_id}",
         f"{CVPIS_BASE}epps/cft/prepareViewCfTWS.do?resourceId={resource_id}",
         f"{CVPIS_BASE}epps/cft/downloadNoticeForAdvSearch.do?resourceId={resource_id}",
     ]
+    headers = {
+        "Accept": "text/html,application/xhtml+xml,application/pdf,*/*",
+        "User-Agent": "Mozilla/5.0 Lietuvos-viesieji-pirkimai-paieska/10.0",
+        "Referer": f"{CVPIS_BASE}epps/cft/prepareViewCfTWS.do?resourceId={resource_id}",
+    }
 
-    pages = []
-    documents = []
-    seen_docs = set()
+    pages, documents = [], []
+    seen_docs, seen_pages = set(), set()
+    queue = list(seed_urls)
 
-    for url in candidate_pages:
+    def add_doc(url: str, label: str):
+        absolute = urljoin(CVPIS_BASE, html.unescape(url).strip())
+        if not absolute or absolute in seen_docs:
+            return
+        seen_docs.add(absolute)
+        documents.append({"label": label.strip() or "Dokumentas", "url": absolute})
+
+    async with httpx.AsyncClient(
+        timeout=_timeout(), follow_redirects=True, headers=headers, http2=False
+    ) as client:
         try:
-            text, final_url = await _fetch_html(url)
-            pages.append({
-                "requested_url": url,
-                "final_url": final_url,
-                "status": "ok",
-            })
+            await client.get(f"{CVPIS_BASE}epps/home.do")
+        except Exception:
+            pass
 
-            for item in _extract_links(text, final_url):
-                if item["url"] in seen_docs:
+        while queue and len(seen_pages) < 30:
+            url = queue.pop(0)
+            if url in seen_pages:
+                continue
+            seen_pages.add(url)
+
+            try:
+                r = await client.get(url)
+                final_url = str(r.url)
+                content_type = r.headers.get("content-type", "")
+                pages.append({
+                    "requested_url": url, "final_url": final_url,
+                    "status": r.status_code, "content_type": content_type,
+                })
+                if r.status_code >= 400:
                     continue
-                seen_docs.add(item["url"])
-                documents.append(item)
 
-        except Exception as exc:
-            pages.append({
-                "requested_url": url,
-                "status": "error",
-                "error": f"{type(exc).__name__}: {exc}",
-            })
+                ct = content_type.casefold()
+                if any(x in ct for x in (
+                    "application/pdf", "application/octet-stream",
+                    "application/vnd", "application/msword"
+                )):
+                    add_doc(final_url, "Atsisiunčiamas dokumentas")
+                    continue
 
-    # Prioritetas sutartims / PDF.
+                page_html = r.text
+                for href, label_html in re.findall(
+                    r'''(?is)<a[^>]+href=["']([^"']+)["'][^>]*>(.*?)</a>''',
+                    page_html,
+                ):
+                    label = _strip_tags(label_html)
+                    absolute = urljoin(final_url, html.unescape(href.strip()))
+                    blob = f"{absolute} {label}".casefold()
+
+                    if _looks_like_document_link(absolute, label):
+                        add_doc(absolute, label)
+
+                    if (
+                        "viesiejipirkimai.lt" in absolute
+                        and resource_id in absolute
+                        and absolute not in seen_pages
+                        and any(x in blob for x in (
+                            "contract", "document", "award", "result",
+                            "cft", "notice", "attachment", "download"
+                        ))
+                    ):
+                        queue.append(absolute)
+
+                raw_candidates = re.findall(
+                    r'''(?is)(?:href|src|data-url|data-href|onclick)\s*=\s*["']([^"']+)["']''',
+                    page_html,
+                )
+                raw_candidates += re.findall(
+                    r'''(?is)["']([^"']*(?:download|document|attachment|contract)[^"']*)["']''',
+                    page_html,
+                )
+
+                for candidate in raw_candidates:
+                    candidate = html.unescape(candidate)
+                    match = re.search(
+                        r'''(https?://[^'"\s)]+|/[^'"\s)]+\.do\?[^'"\s)]+)''',
+                        candidate,
+                    )
+                    if match:
+                        candidate = match.group(1)
+                    absolute = urljoin(final_url, candidate)
+
+                    if _looks_like_document_link(absolute, ""):
+                        add_doc(absolute, "Dokumentas")
+
+                    if (
+                        "viesiejipirkimai.lt" in absolute
+                        and resource_id in absolute
+                        and absolute not in seen_pages
+                    ):
+                        queue.append(absolute)
+
+            except Exception as exc:
+                pages.append({
+                    "requested_url": url, "status": "error",
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+
     def score(item: dict[str, str]) -> int:
         blob = f'{item.get("label","")} {item.get("url","")}'.casefold()
-        s = 0
+        score_value = 0
         if "sutart" in blob or "contract" in blob:
-            s += 20
+            score_value += 100
+        if "award" in blob or "winner" in blob or "result" in blob:
+            score_value += 30
         if ".pdf" in blob:
-            s += 10
+            score_value += 20
+        if any(ext in blob for ext in (".docx", ".doc", ".xlsx", ".xls", ".zip")):
+            score_value += 10
         if "download" in blob or "attachment" in blob:
-            s += 5
-        return s
+            score_value += 5
+        return score_value
 
     documents.sort(key=score, reverse=True)
-
     return {
         "resource_id": resource_id,
         "documents_found": len(documents),
         "documents": documents,
         "pages_checked": pages,
+        "session_crawl": True,
     }
-
 
 @mcp.tool()
 async def extract_contract_documents(resource_id: str) -> str:
@@ -344,7 +427,7 @@ def _cvpp_search_url(query: str, page: int) -> str:
 async def _fetch_cvpp_page(query: str, page: int) -> str:
     headers = {
         "Accept": "text/html,application/xhtml+xml",
-        "User-Agent": "Mozilla/5.0 Lietuvos-viesieji-pirkimai-paieska/9.0",
+        "User-Agent": "Mozilla/5.0 Lietuvos-viesieji-pirkimai-paieska/10.0",
     }
     async with httpx.AsyncClient(timeout=_timeout(), follow_redirects=True) as client:
         r = await client.get(_cvpp_search_url(query, page), headers=headers)
@@ -470,7 +553,7 @@ async def _search_mano_konkursas(
 
     headers = {
         "Accept": "application/json,text/csv,text/plain,*/*",
-        "User-Agent": "Lietuvos-viesieji-pirkimai-paieska/9.0",
+        "User-Agent": "Lietuvos-viesieji-pirkimai-paieska/10.0",
     }
 
     try:
@@ -659,7 +742,7 @@ async def web_search(request: Request) -> HTMLResponse:
 <div></div><div></div>
 <button type="submit">Ištraukti dokumentus</button>
 </form>
-<small>Įrankis patikrina CVP IS dokumentų, pirkimo kortelės ir skelbimo puslapius bei surenka viešas dokumentų atsisiuntimo nuorodas.</small>
+<small>Įrankis su CVP IS sesija pereina per pirkimo, rezultatų ir dokumentų puslapius, surenka failų nuorodas ir pirmiausia rodo tikėtinas sutartis.</small>
 </div>"""
 
     if not run_search:

@@ -115,7 +115,7 @@ async def _fetch_new_page(page: int) -> Any:
         "Accept": "application/json",
         "Content-Type": "application/json",
         "apiKey": _api_key(),
-        "User-Agent": "lietuvos-viesieji-pirkimai/12.0",
+        "User-Agent": "lietuvos-viesieji-pirkimai/13.0",
     }
     body = {"pageSize": VPT_PAGE_SIZE, "pageNum": page}
 
@@ -218,7 +218,7 @@ def _looks_like_document_link(href: str, label: str) -> bool:
 async def _fetch_html(url: str) -> tuple[str, str]:
     headers = {
         "Accept": "text/html,application/xhtml+xml,application/pdf,*/*",
-        "User-Agent": "Mozilla/5.0 Lietuvos-viesieji-pirkimai-paieska/12.0",
+        "User-Agent": "Mozilla/5.0 Lietuvos-viesieji-pirkimai-paieska/13.0",
     }
     async with httpx.AsyncClient(timeout=_timeout(), follow_redirects=True) as client:
         r = await client.get(url, headers=headers)
@@ -278,7 +278,7 @@ async def _probe_document_links(documents: list[dict[str, str]]) -> list[dict[st
             url = item["url"]
             result = dict(item)
             headers = {
-                "User-Agent": "Mozilla/5.0 Lietuvos-viesieji-pirkimai-paieska/12.0",
+                "User-Agent": "Mozilla/5.0 Lietuvos-viesieji-pirkimai-paieska/13.0",
                 "Accept": "*/*",
             }
 
@@ -317,6 +317,114 @@ async def _probe_document_links(documents: list[dict[str, str]]) -> list[dict[st
     return await asyncio.gather(*(probe(item) for item in documents[:20]))
 
 
+
+async def _resolve_html_intermediates(documents: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Jei 'dokumento' nuoroda grąžina HTML, atidaro tą puslapį ir ieško tikro failo URL."""
+    semaphore = asyncio.Semaphore(3)
+
+    async def resolve(item: dict[str, Any]) -> dict[str, Any]:
+        async with semaphore:
+            result = dict(item)
+            ctype = str(result.get("content_type") or "").casefold()
+            if "text/html" not in ctype:
+                return result
+
+            url = result.get("final_url") or result.get("url")
+            if not url:
+                return result
+
+            headers = {
+                "User-Agent": "Mozilla/5.0 Lietuvos-viesieji-pirkimai-paieska/13.0",
+                "Accept": "text/html,application/xhtml+xml,*/*",
+            }
+
+            try:
+                async with httpx.AsyncClient(
+                    timeout=_timeout(),
+                    follow_redirects=True,
+                    headers=headers,
+                    http2=False,
+                    limits=httpx.Limits(max_keepalive_connections=2, max_connections=3),
+                ) as client:
+                    r = await client.get(url)
+                    if r.status_code >= 400:
+                        result["resolve_error"] = f"HTTP {r.status_code}"
+                        return result
+
+                    body = r.text[:2_000_000]
+                    candidates = []
+
+                    # <a href>
+                    for href, label_html in re.findall(
+                        r'''(?is)<a[^>]+href=["']([^"']+)["'][^>]*>(.*?)</a>''',
+                        body,
+                    ):
+                        label = _strip_tags(label_html)[:300]
+                        absolute = urljoin(str(r.url), html.unescape(href.strip()))
+                        blob = f"{absolute} {label}".casefold()
+                        if any(x in blob for x in (
+                            ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".zip",
+                            "download", "attachment", "document", "contract", "sutart"
+                        )):
+                            candidates.append((absolute, label))
+
+                    # data-* / onclick / JS
+                    raw = re.findall(
+                        r'''(?is)(?:href|src|data-url|data-href|onclick)\s*=\s*["']([^"']+)["']''',
+                        body,
+                    )
+                    for candidate in raw:
+                        candidate = html.unescape(candidate)
+                        m = re.search(
+                            r'''(https?://[^'"\s)]+|/[^'"\s)]+)''',
+                            candidate,
+                        )
+                        if m:
+                            absolute = urljoin(str(r.url), m.group(1))
+                            blob = absolute.casefold()
+                            if any(x in blob for x in (
+                                ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".zip",
+                                "download", "attachment", "document"
+                            )):
+                                candidates.append((absolute, "Tikras failas"))
+
+                    # Reitinguojam rastus kandidatus.
+                    def rank(pair):
+                        absolute, label = pair
+                        blob = f"{absolute} {label}".casefold()
+                        score = 0
+                        if "sutart" in blob or "contract" in blob:
+                            score += 100
+                        if "simra" in blob:
+                            score += 80
+                        if ".pdf" in blob:
+                            score += 40
+                        if any(ext in blob for ext in (".docx", ".doc", ".xlsx", ".xls", ".zip")):
+                            score += 20
+                        if "download" in blob or "attachment" in blob:
+                            score += 10
+                        return score
+
+                    if candidates:
+                        candidates = sorted(candidates, key=rank, reverse=True)
+                        best_url, best_label = candidates[0]
+                        result["resolved_file_url"] = best_url
+                        result["resolved_label"] = best_label
+                        result["resolved_candidates"] = [
+                            {"url": u, "label": l, "score": rank((u, l))}
+                            for u, l in candidates[:10]
+                        ]
+                    else:
+                        result["resolved_candidates"] = []
+
+            except Exception as exc:
+                result["resolve_error"] = f"{type(exc).__name__}: {exc}"
+
+            return result
+
+    return await asyncio.gather(*(resolve(item) for item in documents[:20]))
+
+
 async def _extract_cvpis_documents(resource_id: str) -> dict[str, Any]:
     resource_id = str(resource_id).strip()
     if not resource_id.isdigit():
@@ -332,7 +440,7 @@ async def _extract_cvpis_documents(resource_id: str) -> dict[str, Any]:
 
     headers = {
         "Accept": "text/html,application/xhtml+xml,application/pdf,*/*",
-        "User-Agent": "Mozilla/5.0 Lietuvos-viesieji-pirkimai-paieska/12.0",
+        "User-Agent": "Mozilla/5.0 Lietuvos-viesieji-pirkimai-paieska/13.0",
         "Referer": f"{CVPIS_BASE}epps/cft/prepareViewCfTWS.do?resourceId={resource_id}",
     }
 
@@ -428,16 +536,19 @@ async def _extract_cvpis_documents(resource_id: str) -> dict[str, Any]:
 
 
     documents = await _probe_document_links(documents)
+    documents = await _resolve_html_intermediates(documents)
 
     def score(item: dict[str, Any]) -> int:
         blob = " ".join(
             str(item.get(k, ""))
-            for k in ("label", "url", "final_url", "filename", "content_disposition", "content_type")
+            for k in ("label", "url", "final_url", "filename", "content_disposition", "content_type", "resolved_file_url", "resolved_label")
         ).casefold()
 
         score_value = 0
         if "sutart" in blob or "contract" in blob:
             score_value += 200
+        if item.get("resolved_file_url"):
+            score_value += 150
         if "simra" in blob:
             score_value += 120
         if "award" in blob or "winner" in blob or "result" in blob:
@@ -497,7 +608,7 @@ def _cvpp_search_url(query: str, page: int) -> str:
 async def _fetch_cvpp_page(query: str, page: int) -> str:
     headers = {
         "Accept": "text/html,application/xhtml+xml",
-        "User-Agent": "Mozilla/5.0 Lietuvos-viesieji-pirkimai-paieska/12.0",
+        "User-Agent": "Mozilla/5.0 Lietuvos-viesieji-pirkimai-paieska/13.0",
     }
     async with httpx.AsyncClient(timeout=_timeout(), follow_redirects=True) as client:
         r = await client.get(_cvpp_search_url(query, page), headers=headers)
@@ -623,7 +734,7 @@ async def _search_mano_konkursas(
 
     headers = {
         "Accept": "application/json,text/csv,text/plain,*/*",
-        "User-Agent": "Lietuvos-viesieji-pirkimai-paieska/12.0",
+        "User-Agent": "Lietuvos-viesieji-pirkimai-paieska/13.0",
     }
 
     try:
@@ -812,7 +923,7 @@ async def web_search(request: Request) -> HTMLResponse:
 <div></div><div></div>
 <button type="submit">Ištraukti dokumentus</button>
 </form>
-<small>Įrankis su CVP IS sesija surenka failų nuorodas, patikrina jų HTTP antraštes, parodo tikrus failų vardus ir viršuje iškelia labiausiai tikėtiną sutartį.</small>
+<small>Įrankis surenka CVP IS nuorodas, atpažįsta HTML tarpinius puslapius, iš jų ištraukia tikrus failų URL ir viršuje iškelia labiausiai tikėtiną sutartį.</small>
 </div>"""
 
     if not run_search:
@@ -958,15 +1069,29 @@ async def documents_page(request: Request) -> HTMLResponse:
             meta.append(f"<strong>Failas:</strong> {filename}")
         if content_type:
             meta.append(f"<strong>Tipas:</strong> {content_type}")
+        resolved_url_raw = str(doc.get("resolved_file_url") or "")
+        resolved_url = html.escape(resolved_url_raw, quote=True)
+        resolved_label = html.escape(str(doc.get("resolved_label") or ""))
+
         if status:
             meta.append(f"<strong>HTTP:</strong> {status}")
         if score:
             meta.append(f"<strong>Prioritetas:</strong> {score}")
+        if resolved_url_raw:
+            meta.append(f"<strong>Rastas tikras failas:</strong> {resolved_label or 'failas'}")
+
+        links = [f'<a href="{url}" target="_blank" rel="noopener">Atidaryti tarpinį puslapį</a>']
+        if resolved_url_raw:
+            links.insert(
+                0,
+                f'<a href="{resolved_url}" target="_blank" rel="noopener"><strong>Atidaryti tikrą failą</strong></a>'
+            )
 
         docs.append(
             f'<div class="doc">{likely}<strong>{i}. {label}</strong><br>'
             + ("<br>".join(meta) + "<br>" if meta else "")
-            + f'<a href="{url}" target="_blank" rel="noopener">Atidaryti / atsisiųsti</a></div>'
+            + "<br>".join(links)
+            + "</div>"
         )
 
     if not docs:

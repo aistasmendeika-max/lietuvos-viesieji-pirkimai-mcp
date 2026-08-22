@@ -360,9 +360,26 @@ def _page_role(url: str, label: str = "") -> str:
 
 def _extract_procurement_title(page_html: str) -> str:
     text = _strip_tags(page_html)
-    m = re.search(r"Pirkimas:\s*(.+?)(?:Rodyti pirkimo meniu|Pirkimų suvestinės nuoroda:)", text, re.I)
-    if m:
-        return re.sub(r"\s+", " ", m.group(1)).strip()
+
+    patterns = (
+        r"Pirkimas:\s*(.+?)(?:Rodyti pirkimo meniu|Pirkimų suvestinės nuoroda:|Pirkimo dokumentai|Skelbimai)",
+        r"PROCUREMENT:\s*(.+?)(?:Show procurement menu|Documents|Notices)",
+    )
+    for pattern in patterns:
+        m = re.search(pattern, text, re.I)
+        if m:
+            title = re.sub(r"\s+", " ", m.group(1)).strip(" -:;")
+            if len(title) >= 10:
+                return title
+
+    # HTML antraštės atsarginis variantas.
+    for tag in ("h1", "h2", "h3"):
+        m = re.search(fr"(?is)<{tag}[^>]*>(.*?)</{tag}>", page_html)
+        if m:
+            title = _strip_tags(m.group(1))
+            if "pirkim" in _norm(title) and len(title) >= 10:
+                return re.sub(r"\s+", " ", title).strip()
+
     return ""
 
 
@@ -508,6 +525,7 @@ async def inspect_procurement(resource_id: str) -> dict[str, Any]:
     ]
 
     pages, documents = [], []
+    procurement_title = ""
     visited, seen_doc_keys = set(), set()
     queued = [(u, 0, "pradinis") for u in seeds]
 
@@ -741,9 +759,52 @@ async def procurement_page(request: Request) -> HTMLResponse:
             body.append(f'<div class="doc"><strong>{i}. {label}</strong><br>' + "<br>".join(meta) + (f'<br><a href="{url}" target="_blank">Atidaryti dokumentą</a>' if url else "") + "</div>")
         return f'<div class="card {css}"><h2>{title}</h2>{"".join(body) if body else "<p>Nerasta.</p>"}</div>'
 
+    notice_rows = []
+    for i, n in enumerate(result.get("published_notices", []), 1):
+        facts = n.get("facts") or {}
+        meta = []
+        if facts.get("winner"):
+            meta.append(f"<strong>Laimėtojas:</strong> {html.escape(str(facts['winner']))}")
+        if facts.get("value"):
+            meta.append(f"<strong>Vertė:</strong> {html.escape(str(facts['value']))}")
+        if facts.get("contract_date"):
+            meta.append(f"<strong>Sutarties data:</strong> {html.escape(str(facts['contract_date']))}")
+        if n.get("category"):
+            meta.append(f"<strong>Kategorija:</strong> {html.escape(str(n['category']))}")
+        if n.get("similarity") is not None:
+            meta.append(f"<strong>Atitikimas:</strong> {html.escape(str(n['similarity']))}")
+
+        url = html.escape(str(n.get("final_url") or n.get("url") or ""), quote=True)
+        title = html.escape(str(n.get("row_text") or n.get("label") or "Pranešimas"))
+
+        notice_rows.append(
+            f'<div class="doc"><strong>{i}. {title}</strong><br>'
+            + ("<br>".join(meta) + "<br>" if meta else "")
+            + (f'<a href="{url}" target="_blank">Atidaryti oficialų pranešimą</a>' if url else "")
+            + "</div>"
+        )
+
+    notices_section = (
+        '<div class="card note"><h2>Tiksliai šiam pirkimui priskirti paskelbti pranešimai</h2>'
+        + ("".join(notice_rows) if notice_rows else "<p>Nerasta.</p>")
+        + "</div>"
+    )
+
+    status_section = (
+        '<div class="card"><h2>Analizės būsena</h2><p>'
+        + html.escape(str(s.get("contract_status") or ""))
+        + "</p>"
+        + (
+            f'<p><strong>Pirkimo pavadinimas:</strong> {html.escape(str(result.get("procurement_title") or "nenustatytas"))}</p>'
+        )
+        + "</div>"
+    )
+
     sections = [
+        status_section,
         render_docs("Sutartys", result["contracts"], "good"),
         render_docs("Rezultatai / laimėtojas", result["award_documents"], "note"),
+        notices_section,
         render_docs("Visi unikalūs dokumentai", result["documents"]),
         f'<div class="card"><h2>Techninė eiga</h2><pre>{html.escape(json.dumps(result["pages_checked"], ensure_ascii=False, indent=2))}</pre></div>',
     ]
@@ -757,6 +818,52 @@ async def procurement_api(request: Request) -> JSONResponse:
         return JSONResponse(await inspect_procurement(resource_id))
     except Exception as exc:
         return JSONResponse({"error": type(exc).__name__, "message": str(exc)}, status_code=500)
+
+
+def _run_self_tests() -> dict[str, Any]:
+    checks = {}
+
+    # Grynos funkcijos – be tinklo.
+    checks["resource_id_regex"] = (
+        _extract_resource_id("https://viesiejipirkimai.lt/epps/cft/x.do?resourceId=2722748") == "2722748"
+    )
+    checks["award_classification"] = (
+        _classify(
+            "9310977",
+            "https://viesiejipirkimai.lt/epps/notices/downloadNoticeForES.do?resourceId=9312827",
+            "9312827_Contract award notice - general directive, standard regime.pdf",
+            "application/pdf",
+        ) == "rezultatai / laimėtojas"
+    )
+    checks["html_not_contract"] = (
+        _classify(
+            "Atsakymas 1.pdf",
+            "https://viesiejipirkimai.lt/epps/cft/listContractDocuments.do?resourceId=2722748",
+            "",
+            "text/html;charset=utf-8",
+        ) == "HTML puslapis"
+    )
+    checks["real_contract_classification"] = (
+        _classify(
+            "Rangos sutartis",
+            "https://example.invalid/file.pdf",
+            "Pirkimo_sutartis.pdf",
+            "application/pdf",
+        ) == "sutartis"
+    )
+    checks["buyer_match"] = _buyer_match(
+        {"buyer": "Kretingos rajono savivaldybės administracija"},
+        DEFAULT_BUYER,
+    )
+
+    checks["all_passed"] = all(checks.values())
+    return checks
+
+
+@mcp.custom_route("/selftest", methods=["GET"])
+async def selftest(_: Request) -> JSONResponse:
+    checks = _run_self_tests()
+    return JSONResponse(checks, status_code=200 if checks["all_passed"] else 500)
 
 
 @mcp.custom_route("/health", methods=["GET"])

@@ -6,14 +6,14 @@ import json
 import os
 import re
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urljoin
 
 import httpx
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse
+from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 load_dotenv()
 
@@ -34,6 +34,7 @@ VPT_API_URL = os.getenv(
     "VPT_API_URL",
     "https://viesiejipirkimai.lt/epps-integration/api/cft-details-export",
 )
+CVPIS_BASE = "https://viesiejipirkimai.lt/"
 CVPP_BASE_URL = "https://cvpp.eviesiejipirkimai.lt/"
 MANO_KONKURSAS_HOME = "https://www.manokonkursas.lt/"
 MANO_KONKURSAS_EXPORT_URL = os.getenv("MANO_KONKURSAS_EXPORT_URL", "").strip()
@@ -63,7 +64,6 @@ def _json_records(payload: Any) -> list[Any]:
         return payload
     if not isinstance(payload, dict):
         return [payload]
-
     for key in (
         "content", "items", "results", "data", "records",
         "procurements", "cfts", "result"
@@ -75,7 +75,6 @@ def _json_records(payload: Any) -> list[Any]:
             nested = _json_records(value)
             if nested:
                 return nested
-
     return [payload]
 
 
@@ -92,7 +91,6 @@ def _normalize(value: str) -> str:
 def _buyer_match(value: Any, buyer: str) -> bool:
     haystack = _normalize(_text(value))
     buyer_norm = _normalize(buyer)
-
     if buyer_norm in haystack:
         return True
 
@@ -117,7 +115,7 @@ async def _fetch_new_page(page: int) -> Any:
         "Accept": "application/json",
         "Content-Type": "application/json",
         "apiKey": _api_key(),
-        "User-Agent": "lietuvos-viesieji-pirkimai/8.0",
+        "User-Agent": "lietuvos-viesieji-pirkimai/9.0",
     }
     body = {"pageSize": VPT_PAGE_SIZE, "pageNum": page}
 
@@ -132,7 +130,6 @@ async def _fetch_new_page(page: int) -> Any:
         raise RuntimeError(
             f"CVP IS API HTTP {response.status_code}: {response.text[:800]}"
         )
-
     return response.json()
 
 
@@ -155,10 +152,8 @@ async def _scan_cvpis_batch(
     page_numbers = list(range(start_page, start_page + pages))
     batch = await asyncio.gather(*(one(p) for p in page_numbers))
 
-    results = []
-    scanned = 0
-    pages_ok = 0
-    errors = []
+    results, errors = [], []
+    scanned = pages_ok = 0
 
     for page_num, payload, error in sorted(batch, key=lambda x: x[0]):
         if error:
@@ -166,25 +161,18 @@ async def _scan_cvpis_batch(
             continue
 
         pages_ok += 1
-        records = _json_records(payload)
-
-        for record in records:
+        for record in _json_records(payload):
             scanned += 1
-
             if not _buyer_match(record, buyer):
                 continue
-
             if not _keyword_match(record, keyword):
                 continue
 
-            results.append(
-                {
-                    "source": "Nauja CVP IS",
-                    "page": page_num,
-                    "data": record,
-                }
-            )
-
+            results.append({
+                "source": "Nauja CVP IS",
+                "page": page_num,
+                "data": record,
+            })
             if len(results) >= limit:
                 break
 
@@ -206,6 +194,143 @@ async def _scan_cvpis_batch(
     }
 
 
+# ----------------------------
+# CVP IS dokumentų ištraukimas pagal resourceId
+# ----------------------------
+
+def _strip_tags(text: str) -> str:
+    text = re.sub(r"(?is)<script.*?>.*?</script>", " ", text)
+    text = re.sub(r"(?is)<style.*?>.*?</style>", " ", text)
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    text = html.unescape(text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _looks_like_document_link(href: str, label: str) -> bool:
+    blob = f"{href} {label}".casefold()
+    indicators = (
+        "download", "document", "attachment", "contract", "sutart",
+        ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".zip", ".7z", ".rar",
+    )
+    return any(x in blob for x in indicators)
+
+
+async def _fetch_html(url: str) -> tuple[str, str]:
+    headers = {
+        "Accept": "text/html,application/xhtml+xml,application/pdf,*/*",
+        "User-Agent": "Mozilla/5.0 Lietuvos-viesieji-pirkimai-paieska/9.0",
+    }
+    async with httpx.AsyncClient(timeout=_timeout(), follow_redirects=True) as client:
+        r = await client.get(url, headers=headers)
+
+    if r.status_code >= 400:
+        raise RuntimeError(f"HTTP {r.status_code}: {url}")
+
+    return r.text, str(r.url)
+
+
+def _extract_links(page_html: str, base_url: str) -> list[dict[str, str]]:
+    out = []
+    seen = set()
+
+    for href, label_html in re.findall(
+        r'(?is)<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
+        page_html,
+    ):
+        href = html.unescape(href.strip())
+        label = _strip_tags(label_html)
+
+        if not href or href.startswith("#") or href.lower().startswith("javascript:"):
+            continue
+
+        absolute = urljoin(base_url, href)
+
+        if absolute in seen:
+            continue
+        seen.add(absolute)
+
+        if _looks_like_document_link(absolute, label):
+            out.append({
+                "label": label or "Dokumentas",
+                "url": absolute,
+            })
+
+    return out
+
+
+async def _extract_cvpis_documents(resource_id: str) -> dict[str, Any]:
+    resource_id = str(resource_id).strip()
+    if not resource_id.isdigit():
+        raise ValueError("resourceId turi būti skaičius.")
+
+    candidate_pages = [
+        f"{CVPIS_BASE}epps/cft/listContractDocuments.do?resourceId={resource_id}",
+        f"{CVPIS_BASE}epps/cft/prepareViewCfTWS.do?resourceId={resource_id}",
+        f"{CVPIS_BASE}epps/cft/downloadNoticeForAdvSearch.do?resourceId={resource_id}",
+    ]
+
+    pages = []
+    documents = []
+    seen_docs = set()
+
+    for url in candidate_pages:
+        try:
+            text, final_url = await _fetch_html(url)
+            pages.append({
+                "requested_url": url,
+                "final_url": final_url,
+                "status": "ok",
+            })
+
+            for item in _extract_links(text, final_url):
+                if item["url"] in seen_docs:
+                    continue
+                seen_docs.add(item["url"])
+                documents.append(item)
+
+        except Exception as exc:
+            pages.append({
+                "requested_url": url,
+                "status": "error",
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+
+    # Prioritetas sutartims / PDF.
+    def score(item: dict[str, str]) -> int:
+        blob = f'{item.get("label","")} {item.get("url","")}'.casefold()
+        s = 0
+        if "sutart" in blob or "contract" in blob:
+            s += 20
+        if ".pdf" in blob:
+            s += 10
+        if "download" in blob or "attachment" in blob:
+            s += 5
+        return s
+
+    documents.sort(key=score, reverse=True)
+
+    return {
+        "resource_id": resource_id,
+        "documents_found": len(documents),
+        "documents": documents,
+        "pages_checked": pages,
+    }
+
+
+@mcp.tool()
+async def extract_contract_documents(resource_id: str) -> str:
+    """
+    Pagal CVP IS resourceId bando surasti sutarties ir kitų dokumentų
+    atsisiuntimo nuorodas viešoje CVP IS dalyje.
+    """
+    result = await _extract_cvpis_documents(resource_id)
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+# ----------------------------
+# Senasis CVPP
+# ----------------------------
+
 def _cvpp_search_url(query: str, page: int) -> str:
     params = {
         "Query": query,
@@ -219,24 +344,13 @@ def _cvpp_search_url(query: str, page: int) -> str:
 async def _fetch_cvpp_page(query: str, page: int) -> str:
     headers = {
         "Accept": "text/html,application/xhtml+xml",
-        "User-Agent": "Mozilla/5.0 Lietuvos-viesieji-pirkimai-paieska/8.0",
+        "User-Agent": "Mozilla/5.0 Lietuvos-viesieji-pirkimai-paieska/9.0",
     }
-
     async with httpx.AsyncClient(timeout=_timeout(), follow_redirects=True) as client:
         r = await client.get(_cvpp_search_url(query, page), headers=headers)
-
     if r.status_code >= 400:
         raise RuntimeError(f"CVPP paieška HTTP {r.status_code}")
-
     return r.text
-
-
-def _strip_tags(text: str) -> str:
-    text = re.sub(r"(?is)<script.*?>.*?</script>", " ", text)
-    text = re.sub(r"(?is)<style.*?>.*?</style>", " ", text)
-    text = re.sub(r"(?s)<[^>]+>", " ", text)
-    text = html.unescape(text)
-    return re.sub(r"\s+", " ", text).strip()
 
 
 def _absolute_cvpp_url(href: str) -> str:
@@ -271,30 +385,20 @@ def _extract_cvpp_results(page_html: str, keyword: str) -> list[dict[str, Any]]:
                 continue
 
             seen.add(url)
-            hits.append(
-                {
-                    "source": "Senas CVPP",
-                    "title": title,
-                    "url": url,
-                }
-            )
+            hits.append({
+                "source": "Senas CVPP",
+                "title": title,
+                "url": url,
+            })
 
     return hits
 
 
-async def _search_cvpp(
-    buyer: str,
-    keyword: str,
-    limit: int,
-) -> dict[str, Any]:
+async def _search_cvpp(buyer: str, keyword: str, limit: int) -> dict[str, Any]:
     results = []
     pages_scanned = 0
     warning = None
-
-    queries = [buyer]
-    if keyword.strip():
-        queries.append(f"{buyer} {keyword}")
-
+    queries = [buyer] + ([f"{buyer} {keyword}"] if keyword.strip() else [])
     seen = set()
 
     for query in queries:
@@ -316,7 +420,6 @@ async def _search_cvpp(
                     continue
                 seen.add(item["url"])
                 results.append(item)
-
                 if len(results) >= limit:
                     return {
                         "source": "Senas CVPP",
@@ -335,13 +438,15 @@ async def _search_cvpp(
     }
 
 
+# ----------------------------
+# Mano konkursas
+# ----------------------------
+
 def _parse_mano_export(text: str, content_type: str) -> list[Any]:
     ct = (content_type or "").casefold()
-
     if "json" in ct or text.lstrip().startswith(("{", "[")):
         payload = json.loads(text)
         return _json_records(payload)
-
     return list(csv.DictReader(io.StringIO(text)))
 
 
@@ -365,7 +470,7 @@ async def _search_mano_konkursas(
 
     headers = {
         "Accept": "application/json,text/csv,text/plain,*/*",
-        "User-Agent": "Lietuvos-viesieji-pirkimai-paieska/8.0",
+        "User-Agent": "Lietuvos-viesieji-pirkimai-paieska/9.0",
     }
 
     try:
@@ -387,18 +492,14 @@ async def _search_mano_konkursas(
         for record in records:
             if not _buyer_match(record, buyer):
                 continue
-
             if not _keyword_match(record, keyword):
                 continue
 
-            hits.append(
-                {
-                    "source": "Mano konkursas",
-                    "url": MANO_KONKURSAS_HOME,
-                    "data": record,
-                }
-            )
-
+            hits.append({
+                "source": "Mano konkursas",
+                "url": MANO_KONKURSAS_HOME,
+                "data": record,
+            })
             if len(hits) >= limit:
                 break
 
@@ -446,8 +547,7 @@ async def _search_all(
         ),
     )
 
-    combined = []
-    seen = set()
+    combined, seen = [], set()
 
     for group in (cvpis, cvpp, mano):
         for item in group.get("items", []):
@@ -484,10 +584,6 @@ async def search_administration_documents(
     start_page: int = 1,
     limit: int = 50,
 ) -> str:
-    """
-    Ieško pasirinktos administracijos pirkimų ir dokumentų.
-    Papildomas raktažodis neprivalomas.
-    """
     result = await _search_all(
         buyer=buyer.strip() or DEFAULT_BUYER,
         keyword=keyword.strip(),
@@ -519,6 +615,7 @@ pre{{white-space:pre-wrap;word-break:break-word;background:#f8fafc;padding:14px;
 .error{{color:#9b1c1c;background:#fff1f2;padding:14px;border-radius:8px;white-space:pre-wrap}}
 .actions{{display:flex;gap:10px;flex-wrap:wrap;margin-top:16px}}
 a.button{{display:inline-block;text-decoration:none;background:#334155;color:white;padding:11px 14px;border-radius:9px}}
+.doc{{padding:10px 0;border-bottom:1px solid #e5e7eb}}
 @media(max-width:800px){{form{{grid-template-columns:1fr}}}}
 </style></head><body><main>{body}</main></body></html>"""
 
@@ -553,6 +650,16 @@ async def web_search(request: Request) -> HTMLResponse:
 <button type="submit">Ieškoti</button>
 </form>
 <small>Jei papildomo raktažodžio neįrašysite, bus ieškoma visų rastų Administracijos pirkimų ir dokumentų.</small>
+</div>
+
+<div class="card">
+<h2>Ištraukti CVP IS pirkimo dokumentus</h2>
+<form method="get" action="/documents">
+<input name="resource_id" placeholder="CVP IS resourceId, pvz. 2722748">
+<div></div><div></div>
+<button type="submit">Ištraukti dokumentus</button>
+</form>
+<small>Įrankis patikrina CVP IS dokumentų, pirkimo kortelės ir skelbimo puslapius bei surenka viešas dokumentų atsisiuntimo nuorodas.</small>
 </div>"""
 
     if not run_search:
@@ -659,30 +766,61 @@ async def web_search(request: Request) -> HTMLResponse:
     return HTMLResponse(_page(form + summary))
 
 
-@mcp.custom_route("/api/search", methods=["GET"])
-async def api_search(request: Request) -> JSONResponse:
-    buyer = (request.query_params.get("buyer") or DEFAULT_BUYER).strip()
-    keyword = (request.query_params.get("keyword") or "").strip()
+@mcp.custom_route("/documents", methods=["GET"])
+async def documents_page(request: Request) -> HTMLResponse:
+    resource_id = (request.query_params.get("resource_id") or "").strip()
+
+    if not resource_id:
+        return RedirectResponse("/")
 
     try:
-        start_page = max(1, int(request.query_params.get("start_page", "1")))
-    except ValueError:
-        start_page = 1
-
-    try:
-        limit = max(1, min(int(request.query_params.get("limit", "50")), 200))
-    except ValueError:
-        limit = 50
-
-    try:
-        return JSONResponse(
-            await _search_all(
-                buyer=buyer,
-                keyword=keyword,
-                start_page=start_page,
-                limit=limit,
-            )
+        result = await _extract_cvpis_documents(resource_id)
+    except Exception as exc:
+        return HTMLResponse(
+            _page(
+                f'<div class="card"><h1>Dokumentų ištraukimas</h1>'
+                f'<div class="error">{html.escape(type(exc).__name__ + ": " + str(exc))}</div>'
+                f'<p><a href="/">Grįžti</a></p></div>'
+            ),
+            status_code=500,
         )
+
+    docs = []
+    for i, doc in enumerate(result["documents"], 1):
+        label = html.escape(doc.get("label", "Dokumentas"))
+        url = html.escape(doc["url"], quote=True)
+        docs.append(
+            f'<div class="doc"><strong>{i}. {label}</strong><br>'
+            f'<a href="{url}" target="_blank" rel="noopener">Atidaryti / atsisiųsti</a></div>'
+        )
+
+    if not docs:
+        docs.append(
+            "<p>Viešų atsisiuntimo nuorodų automatiškai nerasta. "
+            "Žemiau parodyta, kuriuos CVP IS puslapius pavyko patikrinti.</p>"
+        )
+
+    pages = html.escape(
+        json.dumps(result["pages_checked"], ensure_ascii=False, indent=2)
+    )
+
+    body = f"""
+<div class="card">
+<h1>CVP IS dokumentai: resourceId {html.escape(resource_id)}</h1>
+<p><strong>Rasta dokumentų nuorodų:</strong> {result["documents_found"]}</p>
+{''.join(docs)}
+<h3>Techninė patikra</h3>
+<pre>{pages}</pre>
+<p><a href="/">Grįžti į paiešką</a></p>
+</div>"""
+    return HTMLResponse(_page(body))
+
+
+@mcp.custom_route("/api/documents", methods=["GET"])
+async def documents_api(request: Request) -> JSONResponse:
+    resource_id = (request.query_params.get("resource_id") or "").strip()
+    try:
+        return JSONResponse(await _extract_cvpis_documents(resource_id))
     except Exception as exc:
         return JSONResponse(
             {
